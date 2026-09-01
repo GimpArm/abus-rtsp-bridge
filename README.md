@@ -11,6 +11,10 @@ detail; this file just covers what's here and how to run it.
 
 ## Running it
 
+> **Only one session at a time**: this camera only allows a single active viewing session.
+> While this bridge is connected, the official app cannot connect (and vice versa) - you'll
+> need to close one before the other can view the stream.
+
 ```bash
 python src/abus_rtsp_bridge.py --did <did> --password <password>
 ```
