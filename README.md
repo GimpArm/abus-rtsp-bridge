@@ -23,6 +23,7 @@ python src/abus_rtsp_bridge.py --did <did> --password <password>
 
 | Flag | Default | Description |
 |---|---|---|
+| `--config PATH` | none | Path to a structured YAML (or JSON) config file - see [YAML configuration file](#yaml-configuration-file) below. Also settable via `ABUS_CONFIG_FILE`. |
 | `--did` | none | DID to match (e.g. `ABCD-123456-EFGHI`). Optional on the LAN if `--target-ip` is given, but **required** for the P2P/WAN cloud fallback (see Docker examples below). |
 | `--password` | *(required)* | Camera view password / security code. |
 | `--bind-ip` | auto | Local IPv4 to bind the discovery socket to. |
@@ -46,6 +47,49 @@ python src/abus_rtsp_bridge.py --did <did> --password <password>
 | `--auth-password` | none | Password for `--auth-username`. |
 
 Run `python src/abus_rtsp_bridge.py -h` for the exact, always-current list.
+
+## YAML configuration file
+
+Instead of (or alongside) individual flags/environment variables, every setting can be given
+as one structured YAML file via `--config PATH` or `ABUS_CONFIG_FILE=PATH` - grouped by
+topic rather than a flat list of `KEY: value` pairs. Any explicit CLI flag still overrides
+the same setting from the file. See [config.example.yaml](config.example.yaml) for a
+complete, runnable example; every section/key is optional:
+
+```yaml
+camera:
+  did: ABCD-123456-EFGHI
+  password: changeme
+  bind_ip: 192.168.1.10
+  target_ip: 192.168.1.64
+  timeout: 5.0
+rtsp:
+  url: rtsp://0.0.0.0:8554/abus
+  resolution: 0
+  disable_audio: false
+ptz:
+  enabled: true
+  http_host: 0.0.0.0
+  http_port: 8080
+onvif:
+  enabled: true
+  ws_discovery: true
+  port: 8000
+  ptz_step: 2
+auth:
+  username: null
+  password: null
+diagnostics:
+  debug: false
+  dump_raw: null
+  skip_video_start: false
+  skip_audio_start: false
+```
+
+A typo in a section/key name is rejected with a clear error rather than silently ignored.
+This also makes wrapping the bridge in something that only speaks a single config file (e.g.
+a Home Assistant add-on) straightforward - a Home Assistant add-on's own `/data/options.json`
+works as-is too, since JSON is valid YAML.
 
 ## Running with Docker
 

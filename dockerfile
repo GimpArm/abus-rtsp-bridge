@@ -51,7 +51,7 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-RUN pip wheel --no-cache-dir --wheel-dir /build/wheels PyGObject pycryptodome
+RUN pip wheel --no-cache-dir --wheel-dir /build/wheels PyGObject pycryptodome PyYAML
 
 
 # =========================================================
@@ -80,22 +80,9 @@ COPY --from=builder /build/wheels /wheels
 RUN pip install --no-cache-dir /wheels/* && rm -rf /wheels
 
 WORKDIR /app
-COPY src/abus_rtsp_bridge.py ./src/abus_rtsp_bridge.py
-COPY src/logutil.py ./src/logutil.py
-COPY src/wire_protocol.py ./src/wire_protocol.py
-COPY src/crypto_utils.py ./src/crypto_utils.py
-COPY src/ioctl_protocol.py ./src/ioctl_protocol.py
-COPY src/frame_reassembler.py ./src/frame_reassembler.py
-COPY src/camera_session.py ./src/camera_session.py
-COPY src/ptz_rest_api.py ./src/ptz_rest_api.py
-COPY src/supervisor.py ./src/supervisor.py
-COPY src/gst_rtsp_server.py ./src/gst_rtsp_server.py
-COPY src/onvif_server.py ./src/onvif_server.py
-COPY src/p2p_handshake.py ./src/p2p_handshake.py
-COPY src/http_basic_auth.py ./src/http_basic_auth.py
-COPY scripts/entrypoint.sh /entrypoint.sh
+COPY src/*.py ./src/
+COPY scripts/* /
 RUN chmod +x /entrypoint.sh
-COPY scripts/healthcheck.py /healthcheck.py
 
 ENV ABUS_RTSP_URL="rtsp://0.0.0.0:8554/abus" \
     ABUS_TIMEOUT="5.0"

@@ -4,10 +4,18 @@
 # so they override the equivalent env-derived flag (argparse keeps the last value).
 set -e
 
-: "${ABUS_PASSWORD:?ABUS_PASSWORD environment variable is required}"
+# The password can come from ABUS_PASSWORD OR from a config file's camera.password (e.g. a
+# Home Assistant add-on passing ABUS_CONFIG_FILE=/data/options.json) - only require the env
+# var here if no config file is set; abus_rtsp_bridge.py does the final validation either way.
+if [ -z "$ABUS_CONFIG_FILE" ] && [ -z "$ABUS_PASSWORD" ]; then
+    echo "Either ABUS_PASSWORD or ABUS_CONFIG_FILE (with camera.password set) is required" >&2
+    exit 1
+fi
 
 user_args="$@"
-set -- --password "$ABUS_PASSWORD"
+set --
+[ -n "$ABUS_CONFIG_FILE" ] && set -- "$@" --config "$ABUS_CONFIG_FILE"
+[ -n "$ABUS_PASSWORD" ] && set -- "$@" --password "$ABUS_PASSWORD"
 [ -n "$ABUS_DID" ] && set -- "$@" --did "$ABUS_DID"
 [ -n "$ABUS_BIND_IP" ] && set -- "$@" --bind-ip "$ABUS_BIND_IP"
 [ -n "$ABUS_TARGET_IP" ] && set -- "$@" --target-ip "$ABUS_TARGET_IP"

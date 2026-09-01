@@ -26,6 +26,7 @@ it only startup/connect/reconnect/error events are logged.
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import time
@@ -33,6 +34,7 @@ import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import config_file
 import ioctl_protocol as ioctl
 import logutil
 import onvif_server
@@ -52,8 +54,9 @@ def main() -> int:
     except Exception:
         pass
     p = argparse.ArgumentParser(description="ABUS LAN camera discovery, auth, and RTSP bridge")
+    p.add_argument("--config", default=os.environ.get("ABUS_CONFIG_FILE"), help="Path to a structured YAML (or JSON) config file - see config_file.py's module docstring / config.example.yaml for the schema. Any explicit CLI flag below overrides the same setting from this file. Also settable via ABUS_CONFIG_FILE.")
     p.add_argument("--did", default=None, help="Optional DID to match, e.g. ABCD-123456-EFGHI")
-    p.add_argument("--password", required=True, help="Camera view password / security code")
+    p.add_argument("--password", default=None, help="Camera view password / security code (required, here or in the config file)")
     p.add_argument("--bind-ip", default=None, help="Local IPv4 to bind the discovery socket to")
     p.add_argument("--target-ip", default=None, help="Known camera IP on same LAN")
     p.add_argument("--rtsp-url", default="rtsp://0.0.0.0:8554/abus", help="Destination RTSP URL to publish the stream")
@@ -73,8 +76,22 @@ def main() -> int:
     p.add_argument("--onvif-ptz-step", type=int, default=2, help="How far one ONVIF ContinuousMove/RelativeMove call (e.g. one NVR PTZ button click) moves the camera, on our 1-16 step scale (camera is calibrated at ~34 steps for a full 270-degree horizontal sweep, ~16 steps for a full 90-degree vertical sweep). Default 2 (a modest nudge); raise it if clicks move too little, lower if they still move too far.")
     p.add_argument("--auth-username", default=None, help="If set (together with --auth-password), require HTTP/RTSP Basic auth with this username on the RTSP stream, ONVIF service, and PTZ REST server. Unset (default) means none of them require auth.")
     p.add_argument("--auth-password", default=None, help="Password for --auth-username - both or neither must be set")
+
+    # Pre-scan argv for --config so a file's settings can become the new argparse defaults
+    # BEFORE the real parse below - that way an explicit CLI flag still overrides the same
+    # setting from the file (argparse's normal set_defaults()-vs-explicit-arg precedence).
+    config_pre, _ = p.parse_known_args()
+    if config_pre.config:
+        try:
+            file_defaults = config_file.load_config(config_pre.config)
+        except Exception as exc:
+            p.error(f"--config {config_pre.config!r}: {exc}")
+        p.set_defaults(**file_defaults)
+
     args = p.parse_args()
 
+    if not args.password:
+        p.error("--password is required (via --password, ABUS_PASSWORD, or the config file's camera.password)")
     if bool(args.auth_username) != bool(args.auth_password):
         p.error("--auth-username and --auth-password must be given together")
 
