@@ -1,0 +1,7 @@
+# Only what the Dockerfile actually COPYs is needed in the build context - everything else
+# (local reference material, pcap captures, dump*.h264 test files, docs) gets excluded.
+**
+
+!src/*.py
+!src/requirements.txt
+!scripts/*
