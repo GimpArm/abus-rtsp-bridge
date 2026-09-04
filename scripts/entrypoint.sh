@@ -4,9 +4,17 @@
 # so they override the equivalent env-derived flag (argparse keeps the last value).
 set -e
 
-# The password can come from ABUS_PASSWORD OR from a config file's camera.password (e.g. a
-# Home Assistant add-on passing ABUS_CONFIG_FILE=/data/options.json) - only require the env
-# var here if no config file is set; abus_rtsp_bridge.py does the final validation either way.
+# Under Home Assistant, options are always written to /data/options.json - auto-detect it
+# so the add-on needs zero explicit environment variables (config.yaml's schema/options
+# already cover everything). Plain `docker run` users can still point ABUS_CONFIG_FILE at
+# their own file, which takes priority if set.
+if [ -z "$ABUS_CONFIG_FILE" ] && [ -f /data/options.json ]; then
+    ABUS_CONFIG_FILE=/data/options.json
+fi
+
+# The password can come from ABUS_PASSWORD OR from a config file's camera.password (e.g. the
+# Home Assistant add-on case above) - only require the env var here if no config file is set;
+# abus_rtsp_bridge.py does the final validation either way.
 if [ -z "$ABUS_CONFIG_FILE" ] && [ -z "$ABUS_PASSWORD" ]; then
     echo "Either ABUS_PASSWORD or ABUS_CONFIG_FILE (with camera.password set) is required" >&2
     exit 1
@@ -22,6 +30,9 @@ set --
 [ -n "$ABUS_RTSP_URL" ] && set -- "$@" --rtsp-url "$ABUS_RTSP_URL"
 [ -n "$ABUS_TIMEOUT" ] && set -- "$@" --timeout "$ABUS_TIMEOUT"
 [ -n "$ABUS_RESOLUTION" ] && set -- "$@" --resolution "$ABUS_RESOLUTION"
+[ -n "$ABUS_DISABLE_AUDIO" ] && set -- "$@" --disable-audio
+[ -n "$ABUS_SKIP_VIDEO_START" ] && set -- "$@" --skip-video-start
+[ -n "$ABUS_SKIP_AUDIO_START" ] && set -- "$@" --skip-audio-start
 [ -n "$ABUS_PTZ_HTTP_PORT" ] && set -- "$@" --ptz-http-port "$ABUS_PTZ_HTTP_PORT"
 [ -n "$ABUS_PTZ_HTTP_HOST" ] && set -- "$@" --ptz-http-host "$ABUS_PTZ_HTTP_HOST"
 [ -n "$ABUS_NO_PTZ_HTTP" ] && set -- "$@" --no-ptz-http

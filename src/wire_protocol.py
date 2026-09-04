@@ -65,6 +65,24 @@ AUTH_TYPE_FAILED = 4
 def find_local_ipv4_candidates() -> List[str]:
     candidates: List[str] = []
     seen = set()
+    # Try the outbound-route trick FIRST: connecting a UDP socket (no packets actually sent
+    # for a connectionless socket) and reading back the kernel's chosen source address
+    # reflects the real routing decision for reaching the outside world - reliable even
+    # inside containers. This must come before the hostname-based lookup below: under
+    # Home Assistant's `host_network: true`, gethostname()-based resolution returns
+    # Supervisor's own internal docker-network address (e.g. 172.30.32.x) instead of the
+    # real LAN IP, and since that lookup usually succeeds (just with the WRONG address), it
+    # used to run first and starve this far-more-reliable method from ever being tried.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            if local_ip and local_ip not in seen:
+                seen.add(local_ip)
+                candidates.append(local_ip)
+    except OSError:
+        pass
+
     try:
         for family, _, _, _, sockaddr in socket.getaddrinfo(socket.gethostname(), None):
             if family != socket.AF_INET:
@@ -78,15 +96,6 @@ def find_local_ipv4_candidates() -> List[str]:
     except OSError:
         pass
 
-    if not candidates:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.connect(("8.8.8.8", 80))
-                local_ip = s.getsockname()[0]
-                if local_ip and local_ip not in seen:
-                    candidates.append(local_ip)
-        except OSError:
-            pass
     return candidates
 
 

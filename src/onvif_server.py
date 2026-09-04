@@ -660,10 +660,18 @@ def start_onvif_server(host: str, http_port: int, rtsp_url: str, move_ptz: Calla
                         username: Optional[str] = None, password: Optional[str] = None,
                         max_step_per_move: int = 2,
                         goto_preset: Callable[[int], None] = lambda index: None,
+                        bind_host: str = "0.0.0.0",
                         log: Optional[Callable[[str], None]] = None) -> http.server.ThreadingHTTPServer:
     """Start the ONVIF HTTP/SOAP server (and WS-Discovery responder, unless disabled) in
     background threads. `host` must be a real reachable LAN address (not 0.0.0.0) since it's
-    advertised to clients in XAddrs/GetStreamUri/WS-Discovery replies. HTTP Basic auth is
+    advertised to clients in XAddrs/GetStreamUri/WS-Discovery replies - but the server's own
+    listen socket binds to `bind_host` (default 0.0.0.0, i.e. every interface) instead, NOT
+    to `host` directly: if address auto-detection ever picks a wrong/unreachable address for
+    `host` (e.g. a container-internal address that isn't the real LAN IP), binding the
+    listen socket to that same wrong address would make the port completely unreachable from
+    anywhere, on top of just being advertised wrong - binding to 0.0.0.0 means the port is
+    always actually reachable on every interface regardless, matching how the RTSP/PTZ REST
+    servers already behave. HTTP Basic auth is
     enabled iff both username and password are given (note: WS-Discovery itself is always
     unauthenticated - only the SOAP services are gated - since the discovery protocol has no
     such provision). `max_step_per_move` caps how far a single ContinuousMove/RelativeMove
@@ -675,7 +683,7 @@ def start_onvif_server(host: str, http_port: int, rtsp_url: str, move_ptz: Calla
                        serial_number=serial_number, move_ptz=move_ptz, goto_preset=goto_preset,
                        username=username, password=password, max_step_per_move=max_step_per_move)
     handler_cls = type("_BoundOnvifHandler", (_OnvifHandler,), {"config": cfg})
-    server = http.server.ThreadingHTTPServer((host, http_port), handler_cls)
+    server = http.server.ThreadingHTTPServer((bind_host, http_port), handler_cls)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     _log(f"[onvif] device service at {cfg.device_xaddr}{' [auth required]' if username else ''}")
     if ws_discovery:
