@@ -179,7 +179,8 @@ def main() -> int:
             if args.rtsp_loopback_port:
                 parsed_rtsp = urllib.parse.urlsplit(rtsp_url)
                 bind_rtsp_url = urllib.parse.urlunsplit(parsed_rtsp._replace(netloc=f"127.0.0.1:{args.rtsp_loopback_port}"))
-            log(f"[rtsp] streaming to {bind_rtsp_url}")
+            log(f"[rtsp] streaming to {rtsp_url}"
+                + (f" (internal worker port {bind_rtsp_url}, behind the RTSP gateway)" if args.rtsp_loopback_port else ""))
             session.read_stream(bind_rtsp_url, resolution=args.resolution,
                                  auth_username=args.auth_username, auth_password=args.auth_password,
                                  enable_audio=not args.disable_audio, gst_server_ref=gst_server_ref)

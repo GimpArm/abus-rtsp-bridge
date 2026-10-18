@@ -182,10 +182,12 @@ seconds before falling back automatically:
 
 ```bash
 docker run --rm \
-  -p 8554:8554 -p 8080:8080 -p 8000:8000 \
+  -p 8554:8554 -p 8080:8080 \
   -v ./config.yaml:/config/config.yaml:ro \
   gimparm/abus-rtsp-bridge:latest
 ```
+
+Also publish each camera's `onvif_port` if you enabled ONVIF (e.g. `-p 8000:8000`).
 
 ## PTZ control (REST)
 

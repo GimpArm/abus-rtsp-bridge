@@ -67,7 +67,7 @@ COPY src/*.py ./src/
 COPY scripts/* /
 RUN chmod +x /entrypoint.sh
 
-EXPOSE 8554 8080 8000
+EXPOSE 8554 8080
 EXPOSE 3702/udp
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \

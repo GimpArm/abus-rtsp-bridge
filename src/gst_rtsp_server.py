@@ -269,7 +269,8 @@ class GstAbusRtspServer:
             raise OSError(f"gst-rtsp-server failed to bind {self.host}:{self.port}")
         self._loop_thread = threading.Thread(target=self._loop.run, daemon=True)
         self._loop_thread.start()
-        print(f"[rtsp-gst] listening on rtsp://{self.host}:{self.port}/{self.path}", flush=True)
+        internal = " (internal, behind the RTSP gateway)" if self.host == "127.0.0.1" else ""
+        print(f"[rtsp-gst] listening on rtsp://{self.host}:{self.port}/{self.path}{internal}", flush=True)
 
     def push_access_unit(self, annexb_payload: bytes) -> None:
         """Forward one already-camera-encoded access unit (raw Annex-B bytes, unmodified)
