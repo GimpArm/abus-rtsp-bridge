@@ -17,6 +17,7 @@ rtsp:
   port: 8554                     # single-camera: rtsp://<host>:8554/abus
   resolution: 0
   disable_audio: false
+  disable_talkback: false         # two-way audio via the ONVIF RTSP backchannel
 
 ptz:
   enabled: true

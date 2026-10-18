@@ -20,6 +20,7 @@ related settings together:
       port: 8554
       resolution: 0                    # 0=bySetting 1=fullHD 2=HD 3=SD 4=automatic
       disable_audio: false
+      disable_talkback: false    # true == --disable-talkback (ONVIF RTSP audio backchannel)
     ptz:
       enabled: true              # false == --no-ptz-http
       http_host: 0.0.0.0
@@ -79,8 +80,8 @@ DEFAULT_ONVIF_PORT = 8000
 
 _CAMERA_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _CAMERA_KEYS = frozenset({"did", "password", "bind_ip", "target_ip", "timeout",
-                          "resolution", "disable_audio", "onvif_port", "onvif_ws_discovery",
-                          "onvif_ptz_step"})
+                          "resolution", "disable_audio", "disable_talkback", "onvif_port",
+                          "onvif_ws_discovery", "onvif_ptz_step"})
 
 
 class ConfigError(ValueError):
@@ -95,7 +96,7 @@ _FIELDS: dict[str, list[tuple[str, str, bool]]] = {
     "rtsp": [("bind_ip", "rtsp_bind_ip", False), ("port", "rtsp_port", False),
              ("url", "rtsp_url", False),  # legacy: only its host/port are used, see _shared_settings
              ("resolution", "resolution", False),
-             ("disable_audio", "disable_audio", False)],
+             ("disable_audio", "disable_audio", False), ("disable_talkback", "disable_talkback", False)],
     "ptz": [("enabled", "no_ptz_http", True), ("http_host", "ptz_http_host", False),
             ("http_port", "ptz_http_port", False)],
     "onvif": [("enabled", "no_onvif", True), ("ws_discovery", "no_ws_discovery", True),

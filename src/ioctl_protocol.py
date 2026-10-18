@@ -11,6 +11,12 @@ import struct
 IOCTRL_TYPE_VIDEO_START = 1
 IOCTRL_TYPE_VIDEO_STOP = 2
 IOCTRL_TYPE_AUDIO_START = 3
+IOCTRL_TYPE_DEVINFO_REQ = 5
+IOCTRL_TYPE_DEVINFO_RESP = 6
+# Two-way audio ("intercom"/talk button): SPEAKER_START/STOP, each an 8-byte Ex_IOCTRLAVStream
+# payload (byte[0]=camera index, rest zero). Responses are 196/197.
+IOCTRL_TYPE_SPEAKER_START = 19
+IOCTRL_TYPE_SPEAKER_STOP = 20
 DEFAULT_XOR_KEY_IOCTRL = 2
 
 # Video/audio-start payload quality/resolution constants.

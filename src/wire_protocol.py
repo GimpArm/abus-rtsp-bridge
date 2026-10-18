@@ -55,6 +55,18 @@ CHANNEL_IOCTL = 4
 CHANNEL_REALTIME_AV = 1  # DRW header's channel byte (parse_drw_header) - distinct namespace
 # from the old 8-byte model's CHANNEL_AUTH/IOCTL subtype field despite the same value 1;
 # confirmed via capture analysis: this is the realtime audio/video data channel specifically.
+# Camera -> client IOCTL responses arrive on DRW channel 0 (P2PDev.ThreadRecvIOCtrl).
+CHANNEL_DRW_CONTROL = 0
+# DRW channel the app writes its microphone audio on (P2PDev.CHANNEL_AVDATA_CtoD) - the
+# camera -> app realtime channel above is P2PDev.CHANNEL_AVDATA_DtoC. Each channel has its own
+# 16-bit sequence space.
+CHANNEL_AV_TO_DEVICE = 2
+# OV-serial cameras (DID prefix CO/DO) take their ADPCM talk audio on channel 1 instead
+# (P2PDev.sendAudioDataToDevice) - client -> device has its own sequence space there too.
+CHANNEL_AV_TO_DEVICE_ADPCM = 1
+# libPPCS_API (cs2p2p_PPPP_Write) splits a channel's byte stream into DRW packets of at most
+# 0x400 payload bytes.
+MAX_DRW_PAYLOAD = 1024
 
 AUTH_TYPE_CHALLENGE = 1
 AUTH_TYPE_RESPONSE = 2
@@ -175,6 +187,13 @@ def parse_drw_header(body: bytes) -> Optional[Tuple[int, int, bytes]]:
     channel = body[1]
     seq = struct.unpack_from(">H", body, 2)[0]
     return channel, seq, body[4:]
+
+
+def build_drw_data(channel: int, seq: int, payload: bytes) -> bytes:
+    """One DRW data packet on `channel` (the inverse of parse_drw_header): 0xD1 tag, channel,
+    16-bit BE per-channel sequence number, then up to MAX_DRW_PAYLOAD bytes of the channel's
+    byte stream (cs2p2p_PPPP_DRW_Send)."""
+    return build_f1(MSG_DATA, bytes([0xD1, channel & 0xFF]) + struct.pack(">H", seq & 0xFFFF) + payload)
 
 
 def build_ack(ack_id: int) -> bytes:

@@ -77,6 +77,7 @@ def main() -> int:
     p.add_argument("--dump-raw", default=None, help="Write raw post-auth D0 frames to this file instead of ffmpeg (no ffmpeg required)")
     p.add_argument("--resolution", type=int, default=ioctl.QUALITY_BY_SETTING, help="Video quality/resolution: 0=bySetting 1=fullHD 2=HD 3=SD 4=automatic (default 0, matches the real app's live-view screen)")
     p.add_argument("--disable-audio", action="store_true", help="Disable serving the camera's audio (raw 8kHz mono PCM - confirmed live, despite the AAC we request via AUDIO_START) as a second RTP stream. Audio is served by default.")
+    p.add_argument("--disable-talkback", action="store_true", help="Disable two-way audio: by default RTSP clients that request the ONVIF audio backchannel (e.g. go2rtc/Frigate) can talk through the camera's speaker.")
     p.add_argument("--skip-video-start", action="store_true", help="Test flag: never send IOCTRL_TYPE_VIDEO_START - full_capture4.pcap shows the real app never sends it either, video just starts automatically after auth")
     p.add_argument("--skip-audio-start", action="store_true", help="Test flag: never send IOCTRL_TYPE_AUDIO_START - the first genuine real-app VIDEO_START session we captured (full_capture9.pcap) never sent it either")
     p.add_argument("--debug", action="store_true", help="Log verbose per-packet/per-frame diagnostics (byte-resyncs, heartbeats, keyframe/duplicate-frame tracking, non-video datagrams). Off by default now that the protocol is stable.")
@@ -183,7 +184,8 @@ def main() -> int:
                 + (f" (internal worker port {bind_rtsp_url}, behind the RTSP gateway)" if args.rtsp_loopback_port else ""))
             session.read_stream(bind_rtsp_url, resolution=args.resolution,
                                  auth_username=args.auth_username, auth_password=args.auth_password,
-                                 enable_audio=not args.disable_audio, gst_server_ref=gst_server_ref)
+                                 enable_audio=not args.disable_audio, gst_server_ref=gst_server_ref,
+                                 enable_talkback=not args.disable_talkback)
     finally:
         session.close()
 

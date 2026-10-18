@@ -182,6 +182,7 @@ def start_ptz_http_server(session: "CameraSession", host: str, port: int,
                          "gst_server_ref": gst_server_ref})
     server = http.server.ThreadingHTTPServer((host, port), handler_cls)
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    internal = " (internal, behind the REST gateway)" if host == "127.0.0.1" else ""
     log(f"[ptz-http] listening on http://{host}:{port}/ptz/<direction> (see /directions, /snapshot, /health)"
-        f"{' [auth required]' if username else ''}")
+        f"{internal}{' [auth required]' if username else ''}")
     return server

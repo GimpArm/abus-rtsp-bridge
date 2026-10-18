@@ -28,6 +28,13 @@ gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav (avdec_h26
 gir1.2-gst-rtsp-server-1.0 python3-gi, plus gstreamer1.0-plugins-ugly for x264enc if using
 the software encoder option.
 
+Optional two-way audio: with enable_talkback the server is a GstRTSPOnvifServer and a client that
+asks for the ONVIF backchannel (`Require: www.onvif.org/ver20/backchannel`, e.g. go2rtc/Frigate)
+also gets a receive-only G.711 A-law audio stream in the SDP. Whatever it sends is depayloaded,
+decoded to 8 kHz mono S16LE and handed to `on_talk_audio` (see talkback.py). Backchannel clients
+get their own media (gst-rtsp-server never shares those), so the video/audio appsrcs below are
+fed to every live media, not just one.
+
 Optional RTSP Basic auth (auth_username/auth_password) uses gst-rtsp-server's own
 GstRTSPAuth/permissions mechanism (the same pattern as upstream's examples/test-auth.c, ported
 to this GI binding's non-variadic equivalents). Confirmed live (2026-09) that two of the C
@@ -42,7 +49,8 @@ deploying.
 from __future__ import annotations
 
 import threading
-from typing import Callable, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Optional
 
 try:
     import gi
@@ -58,6 +66,15 @@ except (ImportError, ValueError) as _exc:  # pragma: no cover - depends on syste
 def _factory_exists(name: str) -> bool:
     return Gst.ElementFactory.find(name) is not None
 
+
+@dataclass
+class _MediaState:
+    """The pipeline elements of one live GstRTSPMedia (see GstAbusRtspServer._medias)."""
+    appsrc: Any = None
+    audio_appsrc: Any = None
+    snapshot_sink: Any = None
+
+
 class GstAbusRtspServer:
     """Decode (VAAPI) + re-encode + serve over RTSP via gst-rtsp-server."""
 
@@ -65,7 +82,11 @@ class GstAbusRtspServer:
                  path: str = "abus", enable_audio: bool = True,
                  auth_username: Optional[str] = None, auth_password: Optional[str] = None,
                  on_first_client_connect: Optional[Callable[[], None]] = None,
-                 on_last_client_disconnect: Optional[Callable[[], None]] = None):
+                 on_last_client_disconnect: Optional[Callable[[], None]] = None,
+                 enable_talkback: bool = False,
+                 on_talk_audio: Optional[Callable[[bytes], None]] = None,
+                 talk_sample_rate: int = 8000,
+                 audio_sample_rate: int = 8000):
         if _IMPORT_ERROR is not None:
             raise RuntimeError(
                 "GStreamer + gst-rtsp-server + PyGObject are required for gst_rtsp_server "
@@ -79,21 +100,33 @@ class GstAbusRtspServer:
         self._pps_au = pps_nal if pps_nal.startswith(b"\x00\x00\x00\x01") else b"\x00\x00\x00\x01" + pps_nal
         self._on_first_client_connect = on_first_client_connect
         self._on_last_client_disconnect = on_last_client_disconnect
+        self._on_talk_audio = on_talk_audio
+        self._talk_sample_rate = talk_sample_rate
+        self._audio_sample_rate = audio_sample_rate
 
         self._lock = threading.Lock()
-        self._appsrc: Optional["Gst.Element"] = None
-        self._audio_appsrc: Optional["Gst.Element"] = None
-        self._snapshot_sink: Optional["Gst.Element"] = None
-        self._active = False
+        # Every live media (a shared one for normal clients, one more per backchannel client) and
+        # its appsrcs/snapshot sink. Frames are pushed to all of them; the camera is started when
+        # the first appears and stopped when the last goes away.
+        self._medias: Dict[Any, _MediaState] = {}
 
         pipeline_desc = self._build_pipeline(enable_audio)
 
-        self._server = GstRtspServer.RTSPServer()
+        if enable_talkback:
+            for name in ("rtppcmadepay", "alawdec", "capsfilter", "audioresample"):
+                if not _factory_exists(name):
+                    raise RuntimeError(f"talkback needs the GStreamer element {name!r} (gst-plugins-good)")
+            self._server = GstRtspServer.RTSPOnvifServer()
+            factory = GstRtspServer.RTSPOnvifMediaFactory()
+            factory.set_media_gtype(GstRtspServer.RTSPOnvifMedia.__gtype__)
+            factory.set_backchannel_launch(self._build_backchannel_launch())
+        else:
+            self._server = GstRtspServer.RTSPServer()
+            factory = GstRtspServer.RTSPMediaFactory()
         self._server.set_address(host)
         self._server.set_service(str(port))
         self._server.connect("client-connected", self._on_client_connected)
 
-        factory = GstRtspServer.RTSPMediaFactory()
         factory.set_launch(pipeline_desc)
         # Force RTP-over-TCP (RTSP-interleaved) only - refuses UDP SETUP requests entirely.
         # These are large (tens of KB) 1080p frames, FU-A-fragmented into many RTP/UDP
@@ -214,25 +247,59 @@ class GstAbusRtspServer:
         audio_chain = (
             "appsrc name=asrc is-live=true format=time do-timestamp=true block=false "
             "max-bytes=1000000 leaky-type=downstream "
-            "caps=audio/x-raw,format=S16LE,rate=8000,channels=1,layout=interleaved ! "
+            f"caps=audio/x-raw,format=S16LE,rate={self._audio_sample_rate},channels=1,layout=interleaved ! "
             "audioconvert ! audio/x-raw,format=S16BE ! rtpL16pay name=pay1 pt=98"
         )
         return f"( {video_chain} {audio_chain} )"
 
+    def _build_backchannel_launch(self) -> str:
+        """ONVIF backchannel part gst-rtsp-server adds for clients that require it. The element
+        named depay_backchannel must expose complete, fixed RTP caps on its sink pad (they become
+        the receive-only SDP media), hence the capsfilter in front of the depayloader. Only G.711
+        A-law is offered - one m= line per caps structure would be generated otherwise.
+        async=false: this sink must not block the media from prerolling. The output is resampled
+        to the rate the camera's talk path wants (talk_sample_rate)."""
+        return (
+            "( capsfilter name=depay_backchannel "
+            "caps=\"application/x-rtp,media=(string)audio,payload=(int)8,clock-rate=(int)8000,"
+            "encoding-name=(string)PCMA\" ! rtppcmadepay ! alawdec ! audioconvert ! audioresample ! "
+            f"audio/x-raw,format=S16LE,rate={self._talk_sample_rate},channels=1,layout=interleaved ! "
+            "appsink name=talk_sink emit-signals=true sync=false async=false max-buffers=50 drop=true )"
+        )
+
+    def _on_talk_sample(self, sink) -> "Gst.FlowReturn":
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+        buf = sample.get_buffer()
+        ok, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.FlowReturn.OK
+        try:
+            pcm = bytes(mapinfo.data)
+        finally:
+            buf.unmap(mapinfo)
+        if pcm and self._on_talk_audio:
+            try:
+                self._on_talk_audio(pcm)
+            except Exception as exc:
+                print(f"[rtsp-gst] talkback audio handler failed (ignored): {exc}", flush=True)
+        return Gst.FlowReturn.OK
+
     def _on_media_configure(self, factory, media) -> None:
         print("[rtsp-gst] media-configure fired (client is describing/setting up)", flush=True)
-        appsrc = media.get_element().get_child_by_name("src")
-        audio_appsrc = media.get_element().get_child_by_name("asrc")
-        snapshot_sink = media.get_element().get_child_by_name("snapshot_sink")
-        with self._lock:
-            self._appsrc = appsrc
-            self._audio_appsrc = audio_appsrc
-            self._snapshot_sink = snapshot_sink
+        element = media.get_element()
+        state = _MediaState(appsrc=element.get_by_name("src"), audio_appsrc=element.get_by_name("asrc"),
+                            snapshot_sink=element.get_by_name("snapshot_sink"))
+        talk_sink = element.get_by_name("talk_sink")
+        if talk_sink is not None:
+            print("[rtsp-gst] client requested the ONVIF audio backchannel", flush=True)
+            talk_sink.connect("new-sample", self._on_talk_sample)
         # The camera never sends real SPS/PPS NALs - prime the decoder with the known,
         # hardcoded ones before any real frame so h264parse/the VAAPI decoder can configure
         # themselves. The RE-ENCODER downstream produces its OWN, fully compliant SPS/PPS for
         # whatever plays the served stream - this priming is only needed for our own decode.
-        appsrc.emit("push-buffer", Gst.Buffer.new_wrapped(self._sps_au + self._pps_au))
+        state.appsrc.emit("push-buffer", Gst.Buffer.new_wrapped(self._sps_au + self._pps_au))
         media.connect("new-state", self._on_media_new_state)
         media.connect("unprepared", self._on_media_unprepared)
         # Trigger the camera start HERE (at DESCRIBE time), not on new-state->PLAYING: our
@@ -242,10 +309,9 @@ class GstAbusRtspServer:
         # advance the media towards PLAYING at all. Waiting for PLAYING here is a deadlock:
         # confirmed live - "new-state" never fired, DESCRIBE never completed, VLC timed out.
         with self._lock:
-            if self._active:
-                return
-            self._active = True
-        if self._on_first_client_connect:
+            first = not self._medias
+            self._medias[media] = state
+        if first and self._on_first_client_connect:
             self._on_first_client_connect()
 
     def _on_media_new_state(self, media, state) -> None:
@@ -256,12 +322,9 @@ class GstAbusRtspServer:
     def _on_media_unprepared(self, media) -> None:
         print("[rtsp-gst] media unprepared (all clients gone)", flush=True)
         with self._lock:
-            was_active = self._active
-            self._active = False
-            self._appsrc = None
-            self._audio_appsrc = None
-            self._snapshot_sink = None
-        if was_active and self._on_last_client_disconnect:
+            removed = self._medias.pop(media, None)
+            last = removed is not None and not self._medias
+        if last and self._on_last_client_disconnect:
             self._on_last_client_disconnect()
 
     def start(self) -> None:
@@ -274,38 +337,38 @@ class GstAbusRtspServer:
 
     def push_access_unit(self, annexb_payload: bytes) -> None:
         """Forward one already-camera-encoded access unit (raw Annex-B bytes, unmodified)
-        into the shared decode/re-encode pipeline, if a client is currently connected."""
+        into every live decode/re-encode pipeline, if a client is currently connected."""
         with self._lock:
-            appsrc = self._appsrc
-        if appsrc is None:
-            return
-        appsrc.emit("push-buffer", Gst.Buffer.new_wrapped(bytes(annexb_payload)))
+            targets = [s.appsrc for s in self._medias.values() if s.appsrc is not None]
+        data = bytes(annexb_payload)
+        for appsrc in targets:
+            appsrc.emit("push-buffer", Gst.Buffer.new_wrapped(data))
 
     def push_audio_access_unit(self, pcm_frame: bytes) -> None:
         """Forward one chunk of raw camera PCM audio (8kHz mono S16LE, unmodified) into the
-        audio branch, if a client is currently connected."""
+        audio branch of every live pipeline, if a client is currently connected."""
         with self._lock:
-            audio_appsrc = self._audio_appsrc
-        if audio_appsrc is None:
-            return
-        audio_appsrc.emit("push-buffer", Gst.Buffer.new_wrapped(bytes(pcm_frame)))
+            targets = [s.audio_appsrc for s in self._medias.values() if s.audio_appsrc is not None]
+        data = bytes(pcm_frame)
+        for audio_appsrc in targets:
+            audio_appsrc.emit("push-buffer", Gst.Buffer.new_wrapped(data))
 
     def get_snapshot_jpeg(self) -> Optional[bytes]:
         """Return the most recently decoded video frame, JPEG-encoded, or None if no client
         is currently connected / no frame has been decoded yet. Cheap - just reads the
         snapshot appsink's already-encoded last sample, no extra pipeline work triggered."""
         with self._lock:
-            sink = self._snapshot_sink
-        if sink is None:
-            return None
-        sample = sink.get_property("last-sample")
-        if sample is None:
-            return None
-        buf = sample.get_buffer()
-        ok, mapinfo = buf.map(Gst.MapFlags.READ)
-        if not ok:
-            return None
-        try:
-            return bytes(mapinfo.data)
-        finally:
-            buf.unmap(mapinfo)
+            sinks = [s.snapshot_sink for s in self._medias.values() if s.snapshot_sink is not None]
+        for sink in sinks:
+            sample = sink.get_property("last-sample")
+            if sample is None:
+                continue
+            buf = sample.get_buffer()
+            ok, mapinfo = buf.map(Gst.MapFlags.READ)
+            if not ok:
+                continue
+            try:
+                return bytes(mapinfo.data)
+            finally:
+                buf.unmap(mapinfo)
+        return None

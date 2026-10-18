@@ -15,6 +15,10 @@ detail; this file just covers what's here and how to run it.
 > While this bridge is connected, the official app cannot connect (and vice versa) - you'll
 > need to close one before the other can view the stream.
 
+> **Tip - finding your DID**: if you can't find the camera's DID (e.g. `ABCD-123456-EFGHI`),
+> turn on push notifications for the camera in the ABUS app. The notification your phone
+> receives contains the DID.
+
 ```bash
 python src/abus_rtsp_bridge.py --did <did> --password <password>
 ```
@@ -33,6 +37,7 @@ python src/abus_rtsp_bridge.py --did <did> --password <password>
 | `--timeout` | `5.0` | Discovery timeout in seconds before falling back to P2P/WAN. |
 | `--resolution` | `0` | Video quality: `0`=bySetting `1`=fullHD `2`=HD `3`=SD `4`=automatic. |
 | `--disable-audio` | off | Disable the second (audio) RTP stream. Audio is served by default. |
+| `--disable-talkback` | off | Disable two-way audio (see [Two-way audio](#two-way-audio-talkback)). |
 | `--dump-raw PATH` | none | Diagnostic: write raw post-auth D0 frames to a file instead of streaming. |
 | `--skip-video-start` | off | Diagnostic: never send `IOCTRL_TYPE_VIDEO_START`. |
 | `--skip-audio-start` | off | Diagnostic: never send `IOCTRL_TYPE_AUDIO_START`. |
@@ -69,6 +74,7 @@ rtsp:
   port: 8554
   resolution: 0
   disable_audio: false
+  disable_talkback: false
 ptz:
   enabled: true
   http_host: 0.0.0.0
@@ -111,7 +117,7 @@ cameras:
   - name: garage
     did: WXYZ-987654-ABCDE
     password: garage-password      # optional per-camera overrides: bind_ip, target_ip, timeout,
-                                   # resolution, disable_audio
+                                   # resolution, disable_audio, disable_talkback
     onvif_port: 8000               # ONVIF is off unless set; must be unique per camera
                                    # (also optional: onvif_ws_discovery, onvif_ptz_step)
 ```
@@ -260,6 +266,27 @@ normal, self-healing), or `unhealthy` (reconnecting for >2 minutes straight - so
 genuinely stuck, e.g. the camera is unreachable). Only `unhealthy` returns HTTP 503; every
 other status is 200, since a Docker `HEALTHCHECK` shouldn't restart the container over
 normal transient recovery. The Dockerfile already wires this up via `scripts/healthcheck.py`.
+
+## Two-way audio (talkback)
+
+The RTSP server supports the standard ONVIF audio **backchannel**: a client that sends
+`Require: www.onvif.org/ver20/backchannel` in its DESCRIBE request (go2rtc - and therefore
+Frigate's and Home Assistant's two-way talk - does this) gets one extra send-only audio media in
+the SDP, `PCMA/8000` (G.711 A-law). Whatever audio it sends back is decoded to 8 kHz mono PCM and
+played on the camera's speaker, the same way the phone app's talk button does: the bridge sends
+the camera `IOCTRL_TYPE_SPEAKER_START`, streams the audio in 640-byte frames, and sends
+`IOCTRL_TYPE_SPEAKER_STOP` after one second without audio (or when the last viewer leaves).
+While the speaker is open the camera's own audio is muted in the stream (as in the app) to avoid
+feedback, except on models the app treats as bidirectional (e.g. DC-X15/X16/X18/X19, DP-D2,
+RVDP-RAS, and `DO` doorbells of the RVDP-OAS/OCS/GSO families), which keep playing it. The model
+is read from the camera's device-info response. Cameras whose DID starts with `CO` or `DO` take
+16 kHz ADPCM instead of PCM and send 16 kHz PCM (or 8 kHz ADPCM) back; both are handled
+automatically but haven't been tested on such a camera. Clients that don't ask for the backchannel see the stream exactly as before.
+
+With go2rtc (Frigate), if it doesn't request the backchannel by default, add `#backchannel=1` to
+the RTSP source URL, e.g. `rtsp://<host>:8554/<camera>#backchannel=1`. A backchannel client gets its own decode/encode
+pipeline, so expect roughly double the CPU while it is connected. Turn the feature off with
+`rtsp.disable_talkback: true` (or per camera `disable_talkback`).
 
 ## PTZ control (ONVIF)
 

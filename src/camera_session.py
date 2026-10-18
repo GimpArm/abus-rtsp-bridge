@@ -16,11 +16,15 @@ import time
 import urllib.parse
 from typing import List, Optional, Tuple
 
+import audio_utils
 import crypto_utils
+import device_models
 import frame_reassembler
 import gst_rtsp_server
+import ima_adpcm
 import ioctl_protocol as ioctl
 import p2p_handshake
+import talkback
 import wire_protocol as wire
 from logutil import debug_log, log
 
@@ -63,6 +67,17 @@ class CameraSession:
         self.ack_id = 0
         self.session_key: Optional[bytes] = None
         self.last_video_stop_time = 0.0
+        # Two-way audio: own DRW sequence space for the client -> device AV channel, plus a
+        # counter bumped on every reconnect() so talkback.py can tell its intercom was started
+        # on a session that no longer exists. send_ioctl() is also reachable from the
+        # GStreamer thread now (SPEAKER_START/STOP), hence the lock.
+        self.talk_seq = 0
+        self.session_epoch = 0
+        # Model string from the camera's DEVINFO response (None until it arrives).
+        self.device_model: Optional[str] = None
+        self._talk_lock = threading.Lock()
+        self._ioctl_lock = threading.Lock()
+        self._last_ioctl_time = 0.0
         # Health-check state (see /health in ptz_rest_api.py) - "discovered"/"authed" are
         # deliberately NOT separate flags, just read camera_ip/session_key directly, since
         # those are already the authoritative state and can't drift out of sync.
@@ -76,6 +91,31 @@ class CameraSession:
 
     def close(self) -> None:
         self.sock.close()
+
+    @property
+    def ov_serial(self) -> bool:
+        """The app (P2PDev.isOvSerial) treats DIDs starting with CO or DO as a different camera
+        family: ADPCM talkback audio at 16 kHz and spaced-out IOCTLs."""
+        return bool(self.did) and self.did.upper().startswith(("CO", "DO"))
+
+    @property
+    def audio_sample_rate(self) -> int:
+        """Sample rate of the camera's PCM audio: the app plays OV-serial cameras at 16 kHz and
+        everything else at 8 kHz (P2PDev.ThreadPlayAudio)."""
+        return 16000 if self.ov_serial else 8000
+
+    @property
+    def bidirectional_intercom(self) -> bool:
+        """Whether the camera can talk and play its own audio at once, so its audio must not be
+        muted while the speaker is open. Unknown (no DEVINFO yet) counts as no."""
+        return device_models.is_bidirectional_intercom(self.did, self.device_model)
+
+    def _on_ioctl_response(self, ioctl_type: int, payload: bytes) -> None:
+        if ioctl_type == ioctl.IOCTRL_TYPE_DEVINFO_RESP and len(payload) >= 16:
+            model = payload[:16].split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+            if model and model != self.device_model:
+                self.device_model = model
+                log(f"[device] model {model!r}, bidirectional intercom: {self.bidirectional_intercom}")
 
     def _send(self, frame: bytes, target: Optional[Tuple[str, int]] = None) -> None:
         dest = target or (self.camera_ip, self.camera_port)
@@ -97,8 +137,15 @@ class CameraSession:
         header = ioctl.build_ioctl_head(ioctrl_type, len(payload))
         encrypted_header = crypto_utils.new_ecb_cipher(self.session_key).encrypt(header)
         xored_payload = bytes(b ^ ioctl.DEFAULT_XOR_KEY_IOCTRL for b in payload)
-        frame = wire.build_d0(self.local_seq, wire.CHANNEL_IOCTL, encrypted_header + xored_payload)
-        self.local_seq += 1
+        with self._ioctl_lock:
+            if self.ov_serial:
+                # P2PDev.sendIOCtrl never sends two IOCTLs less than 30ms apart on these cameras.
+                wait = 0.03 - (time.monotonic() - self._last_ioctl_time)
+                if wait > 0:
+                    time.sleep(wait)
+                self._last_ioctl_time = time.monotonic()
+            frame = wire.build_d0(self.local_seq, wire.CHANNEL_IOCTL, encrypted_header + xored_payload)
+            self.local_seq += 1
         self._send(frame)
 
     def start_video(self, channel: int = 0, resolution: int = ioctl.QUALITY_BY_SETTING, audio_notify: int = 0) -> None:
@@ -142,6 +189,39 @@ class CameraSession:
 
         self.send_ioctl(ioctl.IOCTRL_TYPE_VIDEO_STOP, payload)
         self.last_video_stop_time = time.time()
+
+    def start_intercom(self, channel: int = 0) -> None:
+        """Open the camera's speaker for talkback: the same IOCTRL_TYPE_SPEAKER_START the app sends
+        when the talk button is pressed (P2PDevBaseOpt.startIntercom -> Ex_IOCTRLAVStream(camIndex)).
+        Microphone audio is then sent with send_talk_audio()."""
+        payload = bytes([channel & 0xFF, 0, 0, 0, 0, 0, 0, 0])
+        log("[talk] sending IOCTRL_TYPE_SPEAKER_START request")
+        self.send_ioctl(ioctl.IOCTRL_TYPE_SPEAKER_START, payload)
+
+    def stop_intercom(self, channel: int = 0) -> None:
+        payload = bytes([channel & 0xFF, 0, 0, 0, 0, 0, 0, 0])
+        log("[talk] sending IOCTRL_TYPE_SPEAKER_STOP request")
+        self.send_ioctl(ioctl.IOCTRL_TYPE_SPEAKER_STOP, payload)
+
+    def send_talk_audio(self, audio: bytes) -> None:
+        """Send one frame of talk audio to the camera's speaker, already in the camera's talk
+        format (see talkback.py): 8 kHz mono S16LE PCM on DRW channel 2 for normal cameras
+        (P2PDev.sendPCMAudioDataToDevice), or 16 kHz IMA ADPCM on channel 1 for OV-serial ones
+        (P2PDev.sendAudioDataToDevice). Fire-and-forget: unlike the real SDK there is no ack
+        tracking/retransmission, which is fine on a LAN. The channel's byte stream is split into
+        DRW packets of at most MAX_DRW_PAYLOAD bytes, each with the next sequence number."""
+        if not self.session_key or not audio:
+            return
+        if self.ov_serial:
+            codec, channel = frame_reassembler.CODECID_A_ADPCM, wire.CHANNEL_AV_TO_DEVICE_ADPCM
+        else:
+            codec, channel = frame_reassembler.CODECID_A_PCM, wire.CHANNEL_AV_TO_DEVICE
+        stream = frame_reassembler.build_av_frame(self.session_key, codec, frame_reassembler.TALK_FRAME_FLAG, audio)
+        with self._talk_lock:
+            for offset in range(0, len(stream), wire.MAX_DRW_PAYLOAD):
+                chunk = stream[offset:offset + wire.MAX_DRW_PAYLOAD]
+                self._send(wire.build_drw_data(channel, self.talk_seq, chunk))
+                self.talk_seq = (self.talk_seq + 1) & 0xFFFF
 
     def move_ptz(self, direction: int, step: int = 4) -> None:
         """One discrete pan/tilt move. direction is one of the PTZ_* constants (or PTZ_STOP=0
@@ -491,6 +571,8 @@ class CameraSession:
         self.session_key = None
         self.local_seq = 0
         self.ack_id = 0
+        self.talk_seq = 0
+        self.session_epoch += 1
         if not self.discover(target_ip=self.target_ip, timeout=self.discover_timeout):
             log("[reconnect] camera could not be located via Local LAN or P2P cloud")
             return False
@@ -570,7 +652,8 @@ class CameraSession:
     def read_stream(self, target_rtsp_url: str, resolution: int = ioctl.QUALITY_BY_SETTING,
                      auth_username: Optional[str] = None,
                      auth_password: Optional[str] = None, enable_audio: bool = True,
-                     gst_server_ref: Optional[dict] = None) -> None:
+                     gst_server_ref: Optional[dict] = None,
+                     enable_talkback: bool = True) -> None:
         """Decode the post-auth data channel into H.264 access units and hand them to a
         GStreamer-backed RTSP server (gst_rtsp_server.py).
 
@@ -748,6 +831,8 @@ class CameraSession:
 
         def _on_client_disconnect() -> None:
             nonlocal is_streaming, disconnect_timer, disconnect_generation
+            if talk is not None:
+                talk.stop()
             if not is_streaming:
                 return
 
@@ -766,12 +851,18 @@ class CameraSession:
         parsed_url = urllib.parse.urlparse(target_rtsp_url)
         rtsp_host, rtsp_port = parsed_url.hostname or "0.0.0.0", parsed_url.port or 8554
         rtsp_path = parsed_url.path.lstrip("/") or "abus"
+        # Two-way audio: RTSP clients that ask for the ONVIF backchannel send audio that ends up
+        # here (see talkback.py); the camera's own audio is muted while the speaker is open, like
+        # the app does for models without bidirectional intercom, to avoid feedback.
+        talk = talkback.TalkbackController(self) if enable_talkback else None
         server = gst_rtsp_server.GstAbusRtspServer(
             sps_nal=frame_reassembler.H264_SPS[4:], pps_nal=frame_reassembler.H264_PPS[4:],
             host=rtsp_host, port=rtsp_port, path=rtsp_path,
-            enable_audio=enable_audio,
+            enable_audio=enable_audio, audio_sample_rate=self.audio_sample_rate,
             auth_username=auth_username, auth_password=auth_password,
             on_first_client_connect=_on_client_connect, on_last_client_disconnect=_on_client_disconnect,
+            enable_talkback=enable_talkback, on_talk_audio=talk.push_pcm if talk else None,
+            talk_sample_rate=talkback.talk_sample_rate(self),
         )
         try:
             server.start()
@@ -838,6 +929,10 @@ class CameraSession:
         ack_flush_thread.start()
 
         seen_subtypes = set()
+        ioctl_reassembler = None
+        ioctl_reassembler_key = None
+        adpcm_decoder = ima_adpcm.ImaAdpcmDecoder()
+        adpcm_owner = None
         last_packet_time = time.time()
         try:
             while True:
@@ -933,6 +1028,15 @@ class CameraSession:
                 # camera which of its actual packets were received, which likely explains the
                 # post-burst throttling.
                 _enqueue_ack(seq)
+                if channel == wire.CHANNEL_DRW_CONTROL:
+                    # IOCTL responses (e.g. DEVINFO_RESP) - their own byte stream, see IoctlReassembler.
+                    if ioctl_reassembler_key != self.session_key and self.session_key:
+                        ioctl_reassembler = frame_reassembler.IoctlReassembler(self.session_key)
+                        ioctl_reassembler_key = self.session_key
+                    if ioctl_reassembler is not None:
+                        for ioctl_type, ioctl_payload in ioctl_reassembler.feed(drw_payload):
+                            self._on_ioctl_response(ioctl_type, ioctl_payload)
+                    continue
                 if channel != wire.CHANNEL_REALTIME_AV:
                     # Other DRW channels (e.g. channel 0) have their own independent sequence
                     # space - mixing their payload bytes into this reassembler's byte stream
@@ -944,14 +1048,27 @@ class CameraSession:
                         if subtype not in seen_subtypes:
                             seen_subtypes.add(subtype)
                             debug_log(f"[data] first-seen micro-header subtype=0x{subtype:04x} codec_id={codec_id}")
-                        if codec_id == frame_reassembler.CODECID_A_PCM:
-                            # Confirmed live: this camera ignores the AAC we request via
-                            # IOCTRL_TYPE_AUDIO_START and always sends raw 8kHz mono 16-bit
-                            # PCM instead (codec_id=1279) - forward as-is, no repacking needed.
+                        if codec_id in (frame_reassembler.CODECID_A_PCM, frame_reassembler.CODECID_A_ADPCM):
+                            # Raw PCM (codec_id=1279; this camera ignores the AAC we request via
+                            # IOCTRL_TYPE_AUDIO_START) is forwarded as-is, at 16 kHz on OV-serial
+                            # cameras and 8 kHz otherwise. ADPCM (1280) is decoded to 8 kHz PCM the
+                            # way the app does (reset from the first frame's header, then the
+                            # state runs on), and doubled to 16 kHz if the stream runs at that rate.
                             if payload:
+                                if codec_id == frame_reassembler.CODECID_A_ADPCM:
+                                    if adpcm_owner is not reassembler:
+                                        adpcm_decoder.reset(*reassembler.audio_params)
+                                        adpcm_owner = reassembler
+                                    payload = adpcm_decoder.decode(payload[:len(payload) // 160 * 160])
+                                    if self.audio_sample_rate == 16000:
+                                        payload = audio_utils.upsample_2x(payload)
+                                # The app drops the camera's audio while the speaker is open unless
+                                # the model can do both at once (P2PDev.dropAudioData).
+                                if talk is not None and talk.active and not self.bidirectional_intercom:
+                                    continue
                                 if not seen_real_audio:
                                     seen_real_audio = True
-                                    log(f"[audio] first real PCM frame received, len={len(payload)}")
+                                    log(f"[audio] first real audio frame received, codec_id={codec_id}, len={len(payload)}")
                                 server.push_audio_access_unit(payload)
                             continue
                         if codec_id != frame_reassembler.CODEC_H264:
