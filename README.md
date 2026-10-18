@@ -91,6 +91,62 @@ This also makes wrapping the bridge in something that only speaks a single confi
 a Home Assistant add-on) straightforward - a Home Assistant add-on's own `/data/options.json`
 works as-is too, since JSON is valid YAML.
 
+## Multiple cameras
+
+Add a `cameras` list to the config file to run several cameras from one process/container.
+The regular sections (`camera`, `rtsp`, `ptz`, `onvif`, `auth`, `diagnostics`) become defaults
+shared by every camera, and each list entry overrides them:
+
+```yaml
+camera:
+  password: shared-password        # used by every camera that doesn't set its own
+auth:
+  username: viewer
+  password: viewer-password
+cameras:
+  - name: front_door               # unique; letters, digits, _ and -
+    did: ABCD-012345-EFGHI
+  - name: garage
+    did: WXYZ-987654-ABCDE
+    password: garage-password      # optional per-camera overrides: bind_ip, target_ip, timeout,
+                                   # resolution, disable_audio, rtsp_url, onvif_port
+```
+
+Every camera needs a `did` and/or `target_ip`, so discovery can't pick the wrong camera. Each
+camera runs in its own supervised worker process (a crash in one never affects the others)
+and gets its own RTSP and ONVIF port - camera number N (starting at 0) defaults to:
+
+| Service | Default |
+|---|---|
+| RTSP | `rtsp://<host>:8554+N/<name>` |
+| ONVIF | `http://<host>:8000+N` |
+| PTZ/snapshot/health REST | one shared server on `ptz.http_port` (default `8080`), see below |
+
+So the example above serves `rtsp://<host>:8554/front_door` and `rtsp://<host>:8555/garage`.
+Ports can be overridden per camera (`rtsp_url`, `onvif_port`); duplicate DIDs/ports are
+rejected at startup. Log lines are prefixed with the camera name.
+
+**One REST server for all cameras**: the REST API is served once, on `ptz.http_host`/
+`ptz.http_port`, with the camera name as the first path segment:
+
+```bash
+curl http://<host>:8080/garage/ptz/left?step=4
+curl http://<host>:8080/front_door/snapshot -o snapshot.jpg
+curl http://<host>:8080/cameras        # list camera names
+curl http://<host>:8080/health         # worst status across all cameras (503 if any is unhealthy)
+```
+
+Everything under `/<camera>/` is the single-camera API described below (`/ptz/...`, `/light/...`,
+`/siren/...`, `/snapshot`, `/health`, `/directions`). The shared `auth` credentials apply (except
+to `/health` and `/<camera>/health`). Each camera's own REST server only listens on loopback
+(`ptz.http_port` + 1 + N) and is not meant to be used directly. The Docker health check and the
+add-on watchdog use the aggregated `/health`. ONVIF stays per camera.
+
+Notes: in multi-camera mode, `ABUS_*` environment variables and CLI flags apply to **every**
+camera and override the file, so keep per-camera settings (DID, password, ports) in the config
+file and pass only `ABUS_CONFIG_FILE`. `--camera NAME` runs a single camera from such a file by
+hand. With the Docker bridge network, publish every port you use.
+
 ## Running with Docker
 
 Image: [`gimparm/abus-rtsp-bridge:latest`](https://hub.docker.com/r/gimparm/abus-rtsp-bridge).

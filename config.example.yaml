@@ -37,3 +37,15 @@ diagnostics:
   dump_raw: null
   skip_video_start: false
   skip_audio_start: false
+
+# Multiple cameras: uncomment and list them here. The sections above become defaults shared by
+# every camera, and each entry overrides them. Every camera needs a did and/or target_ip. Unless
+# overridden, camera N (0-based) gets RTSP port 8554+N with path /<name> and ONVIF port 8000+N.
+# The REST API stays on the single ptz.http_port, e.g. http://<host>:8080/<name>/ptz/left
+# cameras:
+#   - name: front_door
+#     did: ABCD-012345-EFGHI
+#   - name: garage
+#     did: WXYZ-987654-ABCDE
+#     password: garage-password
+#     # rtsp_url and onvif_port are optional overrides - rarely needed
