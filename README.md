@@ -15,6 +15,10 @@ detail; this file just covers what's here and how to run it.
 > While this bridge is connected, the official app cannot connect (and vice versa) - you'll
 > need to close one before the other can view the stream.
 
+> **Tip - finding your DID**: if you can't find the camera's DID (e.g. `ABCD-123456-EFGHI`),
+> turn on push notifications for the camera in the ABUS app. The notification your phone
+> receives contains the DID.
+
 ```bash
 python src/abus_rtsp_bridge.py --did <did> --password <password>
 ```
@@ -28,10 +32,12 @@ python src/abus_rtsp_bridge.py --did <did> --password <password>
 | `--password` | *(required)* | Camera view password / security code. |
 | `--bind-ip` | auto | Local IPv4 to bind the discovery socket to. |
 | `--target-ip` | none | Known camera IP on the same LAN - skips broadcast discovery and probes this address directly. |
-| `--rtsp-url` | `rtsp://0.0.0.0:8554/abus` | Destination RTSP URL to publish the stream on. |
+| `--rtsp-bind-ip` | `0.0.0.0` | Address the RTSP server listens on. |
+| `--rtsp-port` | `8554` | RTSP port; the stream is served at `rtsp://<bind-ip>:<port>/abus`. |
 | `--timeout` | `5.0` | Discovery timeout in seconds before falling back to P2P/WAN. |
 | `--resolution` | `0` | Video quality: `0`=bySetting `1`=fullHD `2`=HD `3`=SD `4`=automatic. |
 | `--disable-audio` | off | Disable the second (audio) RTP stream. Audio is served by default. |
+| `--disable-talkback` | off | Disable two-way audio (see [Two-way audio](#two-way-audio-talkback)). |
 | `--dump-raw PATH` | none | Diagnostic: write raw post-auth D0 frames to a file instead of streaming. |
 | `--skip-video-start` | off | Diagnostic: never send `IOCTRL_TYPE_VIDEO_START`. |
 | `--skip-audio-start` | off | Diagnostic: never send `IOCTRL_TYPE_AUDIO_START`. |
@@ -64,9 +70,11 @@ camera:
   target_ip: 192.168.1.64
   timeout: 5.0
 rtsp:
-  url: rtsp://0.0.0.0:8554/abus
+  bind_ip: 0.0.0.0              # single camera: rtsp://<host>:8554/abus
+  port: 8554
   resolution: 0
   disable_audio: false
+  disable_talkback: false
 ptz:
   enabled: true
   http_host: 0.0.0.0
@@ -91,11 +99,74 @@ This also makes wrapping the bridge in something that only speaks a single confi
 a Home Assistant add-on) straightforward - a Home Assistant add-on's own `/data/options.json`
 works as-is too, since JSON is valid YAML.
 
+## Multiple cameras
+
+Add a `cameras` list to the config file to run several cameras from one process/container.
+The regular sections (`camera`, `rtsp`, `ptz`, `onvif`, `auth`, `diagnostics`) become defaults
+shared by every camera, and each list entry overrides them:
+
+```yaml
+camera:
+  password: shared-password        # used by every camera that doesn't set its own
+auth:
+  username: viewer
+  password: viewer-password
+cameras:
+  - name: front_door               # unique; letters, digits, _ and -
+    did: ABCD-012345-EFGHI
+  - name: garage
+    did: WXYZ-987654-ABCDE
+    password: garage-password      # optional per-camera overrides: bind_ip, target_ip, timeout,
+                                   # resolution, disable_audio, disable_talkback
+    onvif_port: 8000               # ONVIF is off unless set; must be unique per camera
+                                   # (also optional: onvif_ws_discovery, onvif_ptz_step)
+```
+
+Every camera needs a `did` and/or `target_ip`, so discovery can't pick the wrong camera. Each
+camera runs in its own supervised worker process (a crash in one never affects the others).
+All cameras share one RTSP port, told apart by path; ONVIF is off for a camera unless its entry
+sets `onvif_port`:
+
+| Service | Default |
+|---|---|
+| RTSP | `rtsp://<host>:8554/<name>` (`rtsp.bind_ip`/`rtsp.port`, shared) |
+| ONVIF | disabled; set `onvif_port` on a camera to enable it on that port |
+| PTZ/snapshot/health REST | one shared server on `ptz.http_port` (default `8080`), see below |
+
+So the example above serves `rtsp://<host>:8554/front_door` and `rtsp://<host>:8554/garage`.
+Each camera that enables ONVIF needs its own, unique `onvif_port`, and can also set
+`onvif_ws_discovery` and `onvif_ptz_step`. The root `onvif` section is ignored in multi-camera
+mode. Duplicate
+DIDs/ONVIF ports are
+rejected at startup. Log lines are prefixed with the camera name.
+
+**One REST server for all cameras**: the REST API is served once, on `ptz.http_host`/
+`ptz.http_port`, with the camera name as the first path segment:
+
+```bash
+curl http://<host>:8080/garage/ptz/left?step=4
+curl http://<host>:8080/front_door/snapshot -o snapshot.jpg
+curl http://<host>:8080/cameras        # list camera names
+curl http://<host>:8080/health         # worst status across all cameras (503 if any is unhealthy)
+```
+
+Everything under `/<camera>/` is the single-camera API described below (`/ptz/...`, `/light/...`,
+`/siren/...`, `/snapshot`, `/health`, `/directions`). The shared `auth` credentials apply (except
+to `/health` and `/<camera>/health`). Each camera's own REST server only listens on loopback
+(`ptz.http_port` + 1 + N) and is not meant to be used directly. The Docker health check and the
+add-on watchdog use the aggregated `/health`. ONVIF stays per camera.
+
+Notes: in multi-camera mode, CLI flags apply to **every** camera and override the file, so keep
+per-camera settings (DID, password, ports) in the config file. `--camera NAME` runs a single
+camera from such a file by hand. With the Docker bridge network, publish every port you use.
+
 ## Running with Docker
 
 Image: [`gimparm/abus-rtsp-bridge:latest`](https://hub.docker.com/r/gimparm/abus-rtsp-bridge).
-`ABUS_*` environment variables map 1:1 to the CLI flags above (see `scripts/entrypoint.sh`);
-anything passed after the image name on `docker run` is forwarded as extra CLI args too.
+The container is configured only through the YAML file described above: mount it at
+`/config/config.yaml`, or point `ABUS_CONFIG_FILE` at another path (see
+[config.example.yaml](config.example.yaml)). Anything passed after the image name on
+`docker run` is forwarded as extra CLI args.
 
 **Local LAN discovery** (`--network host`) - needed because UDP broadcast discovery must see
 the camera's physical LAN segment directly, which only works on a real Linux host (bare
@@ -105,26 +176,24 @@ network regardless of `--network host`):
 
 ```bash
 docker run --rm --network host \
-  -e ABUS_PASSWORD=<password> \
-  -e ABUS_DID=<did> \
-  -e ABUS_BIND_IP=<bind-ip> \
-  -e ABUS_TARGET_IP=<target-ip> \
+  -v ./config.yaml:/config/config.yaml:ro \
   gimparm/abus-rtsp-bridge:latest
 ```
 
 **P2P/WAN cloud fallback** - for everywhere else (Docker Desktop, a container not on the
 camera's LAN/VLAN, a cloud/remote host, etc.). No special networking is needed; just publish
-the ports you want reachable. `--did` is **required** here (the cloud rendezvous lookup is
-keyed by it) - LAN discovery is tried first and simply times out after `ABUS_TIMEOUT`
+the ports you want reachable. `camera.did` is **required** here (the cloud rendezvous lookup
+is keyed by it) - LAN discovery is tried first and simply times out after `camera.timeout`
 seconds before falling back automatically:
 
 ```bash
 docker run --rm \
-  -p 8554:8554 -p 8080:8080 -p 8000:8000 \
-  -e ABUS_PASSWORD=<password> \
-  -e ABUS_DID=<did> \
+  -p 8554:8554 -p 8080:8080 \
+  -v ./config.yaml:/config/config.yaml:ro \
   gimparm/abus-rtsp-bridge:latest
 ```
+
+Also publish each camera's `onvif_port` if you enabled ONVIF (e.g. `-p 8000:8000`).
 
 ## PTZ control (REST)
 
@@ -197,6 +266,27 @@ normal, self-healing), or `unhealthy` (reconnecting for >2 minutes straight - so
 genuinely stuck, e.g. the camera is unreachable). Only `unhealthy` returns HTTP 503; every
 other status is 200, since a Docker `HEALTHCHECK` shouldn't restart the container over
 normal transient recovery. The Dockerfile already wires this up via `scripts/healthcheck.py`.
+
+## Two-way audio (talkback)
+
+The RTSP server supports the standard ONVIF audio **backchannel**: a client that sends
+`Require: www.onvif.org/ver20/backchannel` in its DESCRIBE request (go2rtc - and therefore
+Frigate's and Home Assistant's two-way talk - does this) gets one extra send-only audio media in
+the SDP, `PCMA/8000` (G.711 A-law). Whatever audio it sends back is decoded to 8 kHz mono PCM and
+played on the camera's speaker, the same way the phone app's talk button does: the bridge sends
+the camera `IOCTRL_TYPE_SPEAKER_START`, streams the audio in 640-byte frames, and sends
+`IOCTRL_TYPE_SPEAKER_STOP` after one second without audio (or when the last viewer leaves).
+While the speaker is open the camera's own audio is muted in the stream (as in the app) to avoid
+feedback, except on models the app treats as bidirectional (e.g. DC-X15/X16/X18/X19, DP-D2,
+RVDP-RAS, and `DO` doorbells of the RVDP-OAS/OCS/GSO families), which keep playing it. The model
+is read from the camera's device-info response. Cameras whose DID starts with `CO` or `DO` take
+16 kHz ADPCM instead of PCM and send 16 kHz PCM (or 8 kHz ADPCM) back; both are handled
+automatically but haven't been tested on such a camera. Clients that don't ask for the backchannel see the stream exactly as before.
+
+With go2rtc (Frigate), if it doesn't request the backchannel by default, add `#backchannel=1` to
+the RTSP source URL, e.g. `rtsp://<host>:8554/<camera>#backchannel=1`. A backchannel client gets its own decode/encode
+pipeline, so expect roughly double the CPU while it is connected. Turn the feature off with
+`rtsp.disable_talkback: true` (or per camera `disable_talkback`).
 
 ## PTZ control (ONVIF)
 

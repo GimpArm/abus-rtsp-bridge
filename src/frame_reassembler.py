@@ -8,6 +8,8 @@ encrypted/XOR'd frame stream into plain access units, nothing codec-specific bey
 """
 from __future__ import annotations
 
+import struct
+
 import logutil
 import crypto_utils
 
@@ -26,7 +28,23 @@ CODECID_A_AAC = 1283
 # audio-device setup for any non-AAC/ADPCM codec (which is what this camera's PCM frames
 # hit) uses: 8kHz sample rate, mono, 16-bit signed samples (native little-endian format).
 CODECID_A_PCM = 1279
+CODECID_A_ADPCM = 1280
 PCM_SAMPLE_RATE_HZ = 8000
+# Frame-header flag byte the app's ThreadIntercom stamps on every outgoing microphone frame.
+TALK_FRAME_FLAG = 2
+STREAM_IO_TYPE_AV_FRAME = 3
+
+
+def build_av_frame(session_key: bytes, codec_id: int, flag: int, payload: bytes) -> bytes:
+    """Inverse of FrameReassembler for the app -> camera direction (P2PDev.sendPCMAudioDataToDevice +
+    encryptPacket): 4-byte micro-header (24-bit LE size = len(payload)+16, then stream-io-type 3),
+    then the 16-byte frame header AES-ECB encrypted with the session key, then the payload
+    unmodified (xor_key 0). Header layout (AVFrameHead): codec_id LE16, [2]=0, [3]=flag,
+    [4]=xor_key 0, [5:8]=codec parameters (0 for raw PCM), [8:12]=data size LE32, [12:16]=timestamp
+    (the app leaves it 0)."""
+    header = struct.pack("<HBBBBHII", codec_id, 0, flag, 0, 0, 0, len(payload), 0)
+    encrypted = crypto_utils.new_ecb_cipher(session_key).encrypt(header)
+    return (len(payload) + 16).to_bytes(3, "little") + bytes([STREAM_IO_TYPE_AV_FRAME]) + encrypted + payload
 
 
 class FrameReassembler:
@@ -59,6 +77,8 @@ class FrameReassembler:
         self._buf = bytearray()
         self._pending = bytearray()
         self._resync_count = 0
+        # ADPCM audio only: (pre-sample, index) from the header of the frame feed() last yielded.
+        self.audio_params = (0, 0)
 
     def feed(self, chunk: bytes):
         """Feed raw tag/channel/seq-stripped DRW payload bytes. Yields
@@ -94,6 +114,7 @@ class FrameReassembler:
                 self._stream_io_type = stream_io_type
                 self._flag = header[3]
                 self._xor_key = xor_key
+                self.audio_params = (int.from_bytes(header[6:8], "little", signed=True), header[5])
                 self._remaining = data_size
                 self._buf = bytearray()
                 pos += 20
@@ -111,3 +132,39 @@ class FrameReassembler:
                 if self._remaining == 0:
                     yield self._codec_id, self._stream_io_type, self._flag, bytes(self._buf)
         del self._pending[:pos]
+
+
+class IoctlReassembler:
+    """Camera -> client IOCTL responses on DRW channel 0 (what P2PDev's ThreadRecvIOCtrl reads).
+    Same outer shape as the AV stream - 4-byte micro-header (24-bit LE size, stream-io-type 4),
+    then a 16-byte AES-ECB(session_key) header - but the header is an AVIOCtrlHead: ioctl type
+    LE16 @0, data size LE16 @2 (LE32 @8 when that is 0), xor_key @4; payload XOR'd with it.
+    A message whose sizes don't add up is skipped as a whole."""
+
+    def __init__(self, session_key: bytes):
+        self._cipher = crypto_utils.new_ecb_cipher(session_key)
+        self._pending = bytearray()
+
+    def feed(self, chunk: bytes):
+        """Yields (ioctl_type, payload) per complete type-4 message."""
+        self._pending += chunk
+        while len(self._pending) >= 4:
+            size = self._pending[0] | (self._pending[1] << 8) | (self._pending[2] << 16)
+            io_type = self._pending[3]
+            if size < 16 or size > 1 << 16:
+                self._pending.clear()  # hopelessly out of sync - wait for the next message
+                return
+            if len(self._pending) < 4 + size:
+                return
+            message = bytes(self._pending[4:4 + size])
+            del self._pending[:4 + size]
+            if io_type != 4:
+                continue
+            header = self._cipher.decrypt(message[:16])
+            ioctl_type = header[0] | (header[1] << 8)
+            data_size = (header[2] | (header[3] << 8)) or int.from_bytes(header[8:12], "little")
+            if data_size + 16 != size:
+                continue
+            xor_key = header[4]
+            payload = message[16:]
+            yield ioctl_type, (bytes(b ^ xor_key for b in payload) if xor_key else payload)

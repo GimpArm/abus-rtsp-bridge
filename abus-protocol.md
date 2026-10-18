@@ -90,6 +90,39 @@ confirms reachability before starting the real auth exchange.
   video start), this camera always sends raw, unencoded **8kHz mono 16-bit PCM**
   (`codec_id == 1279`), not AAC - a device/firmware quirk, not a bug in the request. Started
   ~10ms after video start.
+- Per the app (`ThreadPlayAudio`), other cameras may send IMA ADPCM (`codec_id == 1280`, 8 kHz):
+  decode 160-byte chunks to 640 bytes of PCM, with the decoder reset ONCE from the first frame's
+  header (pre-sample = LE16 @6, step index = byte @5) and state carried on afterwards. OV-serial
+  cameras (DID `CO`/`DO`) play PCM at 16 kHz. Untested on real hardware.
+
+## Two-way audio (talkback)
+
+Mirrors the app's intercom (`P2PDev.startIntercom` + `ThreadIntercom`, non-"OV serial" DIDs,
+i.e. not starting with `CO`/`DO`). Confirmed working on a real camera.
+
+- `IOCTRL_TYPE_SPEAKER_START` (19, 8-byte payload, `byte[0]`=camera index 0) opens the speaker;
+  `IOCTRL_TYPE_SPEAKER_STOP` (20) closes it. Responses are 196/197.
+- Audio goes camera-ward on **DRW channel 2** (channel 1 is the camera -> client AV channel),
+  with its own 16-bit sequence space, as raw **8kHz mono S16LE PCM** (`codec_id` 1279); the app
+  reads 640 bytes (40ms) from the microphone per frame.
+- Framing mirrors the receive side: 4-byte micro-header (24-bit LE size = `len+16`, type byte
+  `3`) + 16-byte AES-ECB(session_key) frame header (codec_id LE16 @0, flag @3 = `2`, xor_key @4 =
+  `0`, data_size LE32 @8, timestamp @12 = 0) + the PCM unmodified. The stream is split into DRW
+  packets of at most 1024 payload bytes. The real SDK also acks/retransmits these packets; the
+  bridge does not (fire-and-forget).
+- While talking the app drops the camera's own audio unless the model is bidirectional-capable
+  (`ModelHelper`'s per-model `isSupportBiDirectionalIntercom`, or for OV serials a `DO` DID with
+  one of the RVDP-OAS/OCS/GSO/BS device types; see `src/device_models.py`). The model is the
+  first 16 bytes of the DEVINFO response (ioctl 6), which arrives on DRW channel 0: a 4-byte
+  micro-header (24-bit LE size, type 4) + 16-byte AES header (ioctl type LE16 @0, data size LE16
+  @2, xor_key @4) + XOR'd payload.
+- **OV-serial cameras (DID starts with `CO` or `DO`)** differ: the app records **16 kHz** audio,
+  encodes it to IMA ADPCM (`ImaAdpcmCodec`, standard algorithm, low nibble = first sample,
+  predictor/index carried across frames, reset when the intercom starts), reads 1024 PCM bytes
+  (-> 256 ADPCM bytes) at a time and sends 768 ADPCM bytes per frame with `codec_id` 1280 on
+  **DRW channel 1** (client -> device sequence space; frame header params stay 0). Their IOCTLs
+  are also sent at least 30ms apart. Implemented from the decompiled app only - not verified on
+  a real OV-serial camera.
 
 ## IOCTL commands (all via the same AES-ECB + xor_key=2 encrypted 16-byte header format)
 
@@ -97,6 +130,7 @@ confirms reachability before starting the real auth exchange.
 |---|---|
 | 1 / 2 | VIDEO_START / VIDEO_STOP |
 | 3 | AUDIO_START |
+| 19 / 20 | SPEAKER_START / SPEAKER_STOP (two-way audio, see above) |
 | 5 / 6 | DEVINFO_REQ / RESP (model/vendor/firmware string) |
 | 9 | PTZ command (see below) |
 | 192 | Simple on/off light switch |

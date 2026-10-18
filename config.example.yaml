@@ -13,9 +13,11 @@ camera:
   timeout: 5.0
 
 rtsp:
-  url: rtsp://0.0.0.0:8554/abus
+  bind_ip: 0.0.0.0              # listen address
+  port: 8554                     # single-camera: rtsp://<host>:8554/abus
   resolution: 0
   disable_audio: false
+  disable_talkback: false         # two-way audio via the ONVIF RTSP backchannel
 
 ptz:
   enabled: true
@@ -37,3 +39,20 @@ diagnostics:
   dump_raw: null
   skip_video_start: false
   skip_audio_start: false
+
+# Multiple cameras: uncomment and list them here. The sections above become defaults shared by
+# every camera, and each entry overrides them. Every camera needs a did and/or target_ip. All
+# cameras share the RTSP bind_ip/port from the rtsp section and are told apart by path:
+# rtsp://<host>:8554/<name>
+# ONVIF is configured per camera and is off unless the entry sets onvif_port; the root onvif
+# section above is ignored once cameras is set.
+# The REST API stays on the single ptz.http_port, e.g. http://<host>:8080/<name>/ptz/left
+# cameras:
+#   - name: front_door
+#     did: ABCD-012345-EFGHI
+#   - name: garage
+#     did: WXYZ-987654-ABCDE
+#     password: garage-password
+#     onvif_port: 8000          # enables ONVIF for this camera on its own port
+#     # onvif_ws_discovery: true  # optional, with onvif_port
+#     # onvif_ptz_step: 2         # optional, with onvif_port

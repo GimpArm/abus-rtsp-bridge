@@ -6,9 +6,17 @@ module in this project needs to log, and importing the full bridge module just f
 would create a needless circular/heavyweight dependency.
 """
 import time
+from typing import Optional
 
 _T0 = time.time()
 DEBUG = False
+_PREFIX = ""
+
+
+def set_prefix(name: Optional[str]) -> None:
+    """Tag every log line with a camera name so interleaved multi-camera output stays readable."""
+    global _PREFIX
+    _PREFIX = f"[{name}] " if name else ""
 
 
 def set_debug(enabled: bool) -> None:
@@ -24,7 +32,7 @@ def log(msg: str) -> None:
     not take down the camera stream."""
     now = time.time()
     line = (f"[{time.strftime('%H:%M:%S', time.localtime(now))}.{int(now % 1 * 1000):03d} "
-            f"+{now - _T0:8.3f}s] {msg}")
+            f"+{now - _T0:8.3f}s] {_PREFIX}{msg}")
     try:
         print(line, flush=True)
     except (BrokenPipeError, OSError):
