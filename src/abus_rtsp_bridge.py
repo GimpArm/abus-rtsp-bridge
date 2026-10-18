@@ -9,6 +9,7 @@ This is deliberately just orchestration now - the actual protocol/session logic 
   - camera_session.py      - CameraSession: discover -> alive -> auth -> stream lifecycle
   - ptz_rest_api.py        - PTZ/snapshot/health REST server
   - rest_gateway.py        - single REST entry point in front of all cameras' REST servers
+  - rtsp_gateway.py        - single RTSP port in front of all cameras' RTSP servers
   - gst_rtsp_server.py     - GStreamer decode/re-encode + RTSP serving
   - onvif_server.py        - ONVIF device/media/PTZ SOAP service
   - p2p_handshake.py       - CS2/iLnkP2P rendezvous protocol (LAN discovery fallback)
@@ -49,6 +50,7 @@ from camera_session import CameraSession
 from logutil import log
 from ptz_rest_api import start_ptz_http_server
 from rest_gateway import start_rest_gateway
+from rtsp_gateway import start_rtsp_gateway
 
 
 def main() -> int:
@@ -67,7 +69,10 @@ def main() -> int:
     p.add_argument("--password", default=None, help="Camera view password / security code (required, here or in the config file)")
     p.add_argument("--bind-ip", default=None, help="Local IPv4 to bind the discovery socket to")
     p.add_argument("--target-ip", default=None, help="Known camera IP on same LAN")
-    p.add_argument("--rtsp-url", default=config_file.DEFAULT_RTSP_URL, help="Destination RTSP URL to publish the stream")
+    p.add_argument("--rtsp-bind-ip", default=config_file.DEFAULT_RTSP_BIND_IP, help="Address the RTSP server listens on. Default 0.0.0.0.")
+    p.add_argument("--rtsp-port", type=int, default=config_file.DEFAULT_RTSP_PORT, help="RTSP port; the stream is served at rtsp://<bind-ip>:<port>/abus. Default 8554.")
+    p.add_argument("--rtsp-loopback-port", type=int, default=None, help="Internal (set by the multi-camera config): listen on 127.0.0.1:PORT behind the RTSP gateway instead of the bind IP/port.")
+    p.set_defaults(rtsp_url=None)  # full public URL, only ever set per camera by the multi-camera config
     p.add_argument("--timeout", type=float, default=5.0, help="Discovery timeout in seconds")
     p.add_argument("--dump-raw", default=None, help="Write raw post-auth D0 frames to this file instead of ffmpeg (no ffmpeg required)")
     p.add_argument("--resolution", type=int, default=ioctl.QUALITY_BY_SETTING, help="Video quality/resolution: 0=bySetting 1=fullHD 2=HD 3=SD 4=automatic (default 0, matches the real app's live-view screen)")
@@ -97,9 +102,10 @@ def main() -> int:
         p.set_defaults(**file_defaults)
 
     args = p.parse_args()
+    rtsp_url = args.rtsp_url or f"rtsp://{args.rtsp_bind_ip}:{args.rtsp_port}/{config_file.DEFAULT_RTSP_PATH}"
 
     if not args.password:
-        p.error("--password is required (via --password, ABUS_PASSWORD, or the config file's camera.password)")
+        p.error("--password is required (via --password or the config file's camera.password)")
     if bool(args.auth_username) != bool(args.auth_password):
         p.error("--auth-username and --auth-password must be given together")
 
@@ -140,8 +146,8 @@ def main() -> int:
         if not args.no_onvif:
             # ONVIF XAddrs/GetStreamUri must advertise a real, reachable LAN address - the
             # RTSP URL's default host (0.0.0.0) only makes sense for OUR OWN listen socket.
-            advertised_rtsp_url = args.rtsp_url
-            parsed_rtsp = urllib.parse.urlsplit(args.rtsp_url)
+            advertised_rtsp_url = rtsp_url
+            parsed_rtsp = urllib.parse.urlsplit(rtsp_url)
             if parsed_rtsp.hostname in (None, "0.0.0.0"):
                 netloc = f"{session.bind_ip}:{parsed_rtsp.port or 8554}"
                 advertised_rtsp_url = urllib.parse.urlunsplit(parsed_rtsp._replace(netloc=netloc))
@@ -169,8 +175,12 @@ def main() -> int:
         else:
             # read_stream() only requests video/audio once an RTSP client actually connects,
             # and stops it again when the last one disconnects - see read_stream() docstring.
-            log(f"[rtsp] streaming to {args.rtsp_url}")
-            session.read_stream(args.rtsp_url, resolution=args.resolution,
+            bind_rtsp_url = rtsp_url
+            if args.rtsp_loopback_port:
+                parsed_rtsp = urllib.parse.urlsplit(rtsp_url)
+                bind_rtsp_url = urllib.parse.urlunsplit(parsed_rtsp._replace(netloc=f"127.0.0.1:{args.rtsp_loopback_port}"))
+            log(f"[rtsp] streaming to {bind_rtsp_url}")
+            session.read_stream(bind_rtsp_url, resolution=args.resolution,
                                  auth_username=args.auth_username, auth_password=args.auth_password,
                                  enable_audio=not args.disable_audio, gst_server_ref=gst_server_ref)
     finally:
@@ -195,6 +205,9 @@ def _launch_multi_camera() -> Optional[list[tuple[str, list[str]]]]:
     gateway = config_file.rest_gateway_config(known.config)
     if gateway:
         start_rest_gateway(**gateway)
+    rtsp_gateway = config_file.rtsp_gateway_config(known.config)
+    if rtsp_gateway:
+        start_rtsp_gateway(**rtsp_gateway)
     return [(name, ["--camera", name]) for name in names]
 
 

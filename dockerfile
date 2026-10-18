@@ -10,30 +10,13 @@
 # real Linux host on the same LAN, or run src/abus_rtsp_bridge.py directly
 # without Docker.
 #
-# Configure via environment variables (see scripts/entrypoint.sh):
-#   ABUS_PASSWORD       (required) camera view password / security code
-#   ABUS_DID            optional DID to match, e.g. ABCD-123456-EFGHI
-#   ABUS_BIND_IP        optional local IPv4 to bind the discovery socket to
-#   ABUS_TARGET_IP      optional known camera IP on the same LAN
-#   ABUS_RTSP_URL       destination RTSP URL (default rtsp://0.0.0.0:8554/abus)
-#   ABUS_TIMEOUT        discovery timeout in seconds (default 5.0)
-#   ABUS_RESOLUTION     video quality: 0=bySetting 1=fullHD 2=HD 3=SD 4=auto
-#   ABUS_PTZ_HTTP_PORT  PTZ REST server port (default 8080); ABUS_NO_PTZ_HTTP=1 disables it
-#   ABUS_ONVIF_PORT     ONVIF device/media/PTZ SOAP port (default 8000)
-#   ABUS_ONVIF_PTZ_STEP how far one ONVIF PTZ click moves the camera (default 2)
-#   ABUS_NO_ONVIF       set to disable the ONVIF service entirely
-#   ABUS_NO_WS_DISCOVERY set to disable the WS-Discovery multicast responder only
-#   ABUS_AUTH_USERNAME / ABUS_AUTH_PASSWORD   optional, both required together - HTTP/RTSP
-#                       Basic auth shared by the RTSP stream, ONVIF service, and PTZ REST
-#   ABUS_DEBUG          set to enable verbose per-packet/per-frame diagnostic logging
+# Configure with a YAML file (see config.example.yaml), mounted at /config/config.yaml or
+# pointed to by ABUS_CONFIG_FILE (see scripts/entrypoint.sh).
 #
 # Example (on a Linux host that is actually on the camera's LAN):
 #   docker build -t abus-rtsp-bridge .
 #   docker run --rm --network host \
-#     -e ABUS_PASSWORD=<password> \
-#     -e ABUS_DID=<did> \
-#     -e ABUS_BIND_IP=<bind-ip> \
-#     -e ABUS_TARGET_IP=<target-ip> \
+#     -v ./config.yaml:/config/config.yaml:ro \
 #     abus-rtsp-bridge
 
 # =========================================================
@@ -83,9 +66,6 @@ WORKDIR /app
 COPY src/*.py ./src/
 COPY scripts/* /
 RUN chmod +x /entrypoint.sh
-
-ENV ABUS_RTSP_URL="rtsp://0.0.0.0:8554/abus" \
-    ABUS_TIMEOUT="5.0"
 
 EXPOSE 8554 8080 8000
 EXPOSE 3702/udp

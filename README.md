@@ -28,7 +28,8 @@ python src/abus_rtsp_bridge.py --did <did> --password <password>
 | `--password` | *(required)* | Camera view password / security code. |
 | `--bind-ip` | auto | Local IPv4 to bind the discovery socket to. |
 | `--target-ip` | none | Known camera IP on the same LAN - skips broadcast discovery and probes this address directly. |
-| `--rtsp-url` | `rtsp://0.0.0.0:8554/abus` | Destination RTSP URL to publish the stream on. |
+| `--rtsp-bind-ip` | `0.0.0.0` | Address the RTSP server listens on. |
+| `--rtsp-port` | `8554` | RTSP port; the stream is served at `rtsp://<bind-ip>:<port>/abus`. |
 | `--timeout` | `5.0` | Discovery timeout in seconds before falling back to P2P/WAN. |
 | `--resolution` | `0` | Video quality: `0`=bySetting `1`=fullHD `2`=HD `3`=SD `4`=automatic. |
 | `--disable-audio` | off | Disable the second (audio) RTP stream. Audio is served by default. |
@@ -64,7 +65,8 @@ camera:
   target_ip: 192.168.1.64
   timeout: 5.0
 rtsp:
-  url: rtsp://0.0.0.0:8554/abus
+  bind_ip: 0.0.0.0              # single camera: rtsp://<host>:8554/abus
+  port: 8554
   resolution: 0
   disable_audio: false
 ptz:
@@ -109,21 +111,27 @@ cameras:
   - name: garage
     did: WXYZ-987654-ABCDE
     password: garage-password      # optional per-camera overrides: bind_ip, target_ip, timeout,
-                                   # resolution, disable_audio, rtsp_url, onvif_port
+                                   # resolution, disable_audio
+    onvif_port: 8000               # ONVIF is off unless set; must be unique per camera
+                                   # (also optional: onvif_ws_discovery, onvif_ptz_step)
 ```
 
 Every camera needs a `did` and/or `target_ip`, so discovery can't pick the wrong camera. Each
-camera runs in its own supervised worker process (a crash in one never affects the others)
-and gets its own RTSP and ONVIF port - camera number N (starting at 0) defaults to:
+camera runs in its own supervised worker process (a crash in one never affects the others).
+All cameras share one RTSP port, told apart by path; ONVIF is off for a camera unless its entry
+sets `onvif_port`:
 
 | Service | Default |
 |---|---|
-| RTSP | `rtsp://<host>:8554+N/<name>` |
-| ONVIF | `http://<host>:8000+N` |
+| RTSP | `rtsp://<host>:8554/<name>` (`rtsp.bind_ip`/`rtsp.port`, shared) |
+| ONVIF | disabled; set `onvif_port` on a camera to enable it on that port |
 | PTZ/snapshot/health REST | one shared server on `ptz.http_port` (default `8080`), see below |
 
-So the example above serves `rtsp://<host>:8554/front_door` and `rtsp://<host>:8555/garage`.
-Ports can be overridden per camera (`rtsp_url`, `onvif_port`); duplicate DIDs/ports are
+So the example above serves `rtsp://<host>:8554/front_door` and `rtsp://<host>:8554/garage`.
+Each camera that enables ONVIF needs its own, unique `onvif_port`, and can also set
+`onvif_ws_discovery` and `onvif_ptz_step`. The root `onvif` section is ignored in multi-camera
+mode. Duplicate
+DIDs/ONVIF ports are
 rejected at startup. Log lines are prefixed with the camera name.
 
 **One REST server for all cameras**: the REST API is served once, on `ptz.http_host`/
@@ -142,16 +150,17 @@ to `/health` and `/<camera>/health`). Each camera's own REST server only listens
 (`ptz.http_port` + 1 + N) and is not meant to be used directly. The Docker health check and the
 add-on watchdog use the aggregated `/health`. ONVIF stays per camera.
 
-Notes: in multi-camera mode, `ABUS_*` environment variables and CLI flags apply to **every**
-camera and override the file, so keep per-camera settings (DID, password, ports) in the config
-file and pass only `ABUS_CONFIG_FILE`. `--camera NAME` runs a single camera from such a file by
-hand. With the Docker bridge network, publish every port you use.
+Notes: in multi-camera mode, CLI flags apply to **every** camera and override the file, so keep
+per-camera settings (DID, password, ports) in the config file. `--camera NAME` runs a single
+camera from such a file by hand. With the Docker bridge network, publish every port you use.
 
 ## Running with Docker
 
 Image: [`gimparm/abus-rtsp-bridge:latest`](https://hub.docker.com/r/gimparm/abus-rtsp-bridge).
-`ABUS_*` environment variables map 1:1 to the CLI flags above (see `scripts/entrypoint.sh`);
-anything passed after the image name on `docker run` is forwarded as extra CLI args too.
+The container is configured only through the YAML file described above: mount it at
+`/config/config.yaml`, or point `ABUS_CONFIG_FILE` at another path (see
+[config.example.yaml](config.example.yaml)). Anything passed after the image name on
+`docker run` is forwarded as extra CLI args.
 
 **Local LAN discovery** (`--network host`) - needed because UDP broadcast discovery must see
 the camera's physical LAN segment directly, which only works on a real Linux host (bare
@@ -161,24 +170,20 @@ network regardless of `--network host`):
 
 ```bash
 docker run --rm --network host \
-  -e ABUS_PASSWORD=<password> \
-  -e ABUS_DID=<did> \
-  -e ABUS_BIND_IP=<bind-ip> \
-  -e ABUS_TARGET_IP=<target-ip> \
+  -v ./config.yaml:/config/config.yaml:ro \
   gimparm/abus-rtsp-bridge:latest
 ```
 
 **P2P/WAN cloud fallback** - for everywhere else (Docker Desktop, a container not on the
 camera's LAN/VLAN, a cloud/remote host, etc.). No special networking is needed; just publish
-the ports you want reachable. `--did` is **required** here (the cloud rendezvous lookup is
-keyed by it) - LAN discovery is tried first and simply times out after `ABUS_TIMEOUT`
+the ports you want reachable. `camera.did` is **required** here (the cloud rendezvous lookup
+is keyed by it) - LAN discovery is tried first and simply times out after `camera.timeout`
 seconds before falling back automatically:
 
 ```bash
 docker run --rm \
   -p 8554:8554 -p 8080:8080 -p 8000:8000 \
-  -e ABUS_PASSWORD=<password> \
-  -e ABUS_DID=<did> \
+  -v ./config.yaml:/config/config.yaml:ro \
   gimparm/abus-rtsp-bridge:latest
 ```
 
