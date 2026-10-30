@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lightweight, dependency-free REST server for PTZ control, snapshots, siren/light, and
 health checks - GET/POST /ptz/<direction>, /ptz/preset/<0-2>, /light/<on|off>,
-/siren/<on|off>, /snapshot, /health, /directions, and POST /audio?audio=<url> to play an
+/siren/<on|off>, /snapshot, /health, /directions, and POST /play?source=<url> to play an
 audio file (mp3 etc.) on the camera's speaker.
 
 Runs in a daemon thread; shares the same authenticated CameraSession/UDP socket the RTSP
@@ -110,13 +110,13 @@ class _PtzRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             self._reply_jpeg(jpeg)
             return
-        if len(parts) == 1 and parts[0] == "audio":
+        if len(parts) == 1 and parts[0] == "play":
             if self.command != "POST":
-                self._reply(405, {"error": "use POST /audio?audio=<url of an mp3>"})
+                self._reply(405, {"error": "use POST /play?source=<url of an mp3>"})
                 return
-            urls = query.get("audio")
+            urls = query.get("source")
             if not urls:
-                self._reply(400, {"error": "missing 'audio' query parameter (URL of an mp3)"})
+                self._reply(400, {"error": "missing 'source' query parameter (URL of an mp3)"})
                 return
             try:
                 seconds = self.audio_player.play_url(urls[0])
@@ -157,7 +157,7 @@ class _PtzRequestHandler(http.server.BaseHTTPRequestHandler):
             self._reply(200, {"ok": True, parts[0]: action})
             return
         if len(parts) != 2 or parts[0] != "ptz":
-            self._reply(404, {"error": "not found", "try": "/ptz/<direction>?step=N, /ptz/preset/<0-2>, /light/<on|off>, /siren/<on|off>, /snapshot, /health, /directions, POST /audio?audio=<url>"})
+            self._reply(404, {"error": "not found", "try": "/ptz/<direction>?step=N, /ptz/preset/<0-2>, /light/<on|off>, /siren/<on|off>, /snapshot, /health, /directions, POST /play?source=<url>"})
             return
         direction_name = parts[1].lower()
         if direction_name not in ioctl.PTZ_DIRECTIONS:

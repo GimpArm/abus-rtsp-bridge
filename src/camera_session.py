@@ -76,7 +76,7 @@ class CameraSession:
         # Model string from the camera's DEVINFO response (None until it arrives).
         self.device_model: Optional[str] = None
         self._talk_lock = threading.Lock()
-        # One controller for every audio source (RTSP backchannel, REST /audio) so only one
+        # One controller for every audio source (RTSP backchannel, REST /play) so only one
         # of them opens/closes the camera's speaker at a time.
         self.talkback = talkback.TalkbackController(self)
         self._ioctl_lock = threading.Lock()

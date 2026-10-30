@@ -5,7 +5,7 @@ The file is downloaded, decoded with GStreamer to mono S16LE PCM at the rate the
 path expects (see talkback.py) and then fed to the shared TalkbackController in real time, so it
 goes through exactly the same SPEAKER_START / audio / SPEAKER_STOP flow as RTSP talkback.
 
-Used by POST /audio?audio=<url> on the REST server (ptz_rest_api.py). Download and decode happen
+Used by POST /play?source=<url> on the REST server (ptz_rest_api.py). Download and decode happen
 before the request is answered, so a bad URL or an undecodable file is reported to the caller;
 playback itself continues in the background.
 """

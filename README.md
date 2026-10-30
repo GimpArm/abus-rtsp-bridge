@@ -94,7 +94,7 @@ curl http://<host>:8080/health         # worst status across all cameras (503 if
 ```
 
 Everything under `/<camera>/` is the per-camera API described below (`/ptz/...`, `/light/...`,
-`/siren/...`, `/snapshot`, `/audio`, `/health`, `/directions`). The shared `auth` credentials
+`/siren/...`, `/snapshot`, `/play`, `/health`, `/directions`). The shared `auth` credentials
 apply (except to `/health` and `/<camera>/health`). Each camera's own REST and RTSP servers
 only listen on loopback (`ptz.http_port` + 1 + N and `rtsp.port` + 1 + N for camera number N,
 counting from 0) and are not meant to be used directly. The Docker health check uses the
@@ -233,11 +233,11 @@ pipeline, so expect roughly double the CPU while it is connected. Turn the featu
 
 ### Playing an audio file (REST)
 
-`POST /audio?audio=<url>` downloads an audio file (mp3, or anything GStreamer can decode) and plays
+`POST /play?source=<url>` downloads an audio file (mp3, or anything GStreamer can decode) and plays
 it on the camera's speaker through the same talk path - no RTSP client needed:
 
 ```bash
-curl -X POST "http://<host>:8080/<camera>/audio?audio=http://example.com/doorbell.mp3"
+curl -X POST "http://<host>:8080/<camera>/play?source=http://example.com/doorbell.mp3"
 ```
 
 The file is fetched and decoded before the request is answered, so a bad URL or an undecodable
