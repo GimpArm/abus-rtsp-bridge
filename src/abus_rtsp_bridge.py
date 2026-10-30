@@ -14,14 +14,14 @@ This is deliberately just orchestration now - the actual protocol/session logic 
   - onvif_server.py        - ONVIF device/media/PTZ SOAP service
   - p2p_handshake.py       - CS2/iLnkP2P rendezvous protocol (LAN discovery fallback)
   - supervisor.py          - self-restarting process wrapper (one worker process per camera)
-  - config_file.py         - YAML config, including the multi-camera `cameras` list
+  - config_file.py         - YAML config (the `cameras` list plus shared sections)
 See abus-protocol.md (repo memory) for the full reverse-engineering history.
 
 Run:
-python src/abus_rtsp_bridge.py --did <did> --password <password> --bind-ip <bind-ip> --target-ip <target-ip>
+python src/abus_rtsp_bridge.py --config config.yaml
 
-Several cameras: define a `cameras` list in the --config file (see config.example.yaml). The
-supervisor then starts one worker per camera, each started internally with `--camera NAME`.
+Every camera is an entry of the config file's `cameras` list (see config.example.yaml). The
+supervisor starts one worker per camera, each started internally with `--camera NAME`.
 
 This process is meant to run unattended (e.g. in a Docker container, or detached from any
 terminal) - it ignores SIGHUP and never lets a broken stdout (log consumer going away) kill
@@ -38,11 +38,9 @@ import sys
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config_file
-import ioctl_protocol as ioctl
 import logutil
 import onvif_server
 import supervisor
@@ -63,52 +61,18 @@ def main() -> int:
     except Exception:
         pass
     p = argparse.ArgumentParser(description="ABUS LAN camera discovery, auth, and RTSP bridge")
-    p.add_argument("--config", default=os.environ.get("ABUS_CONFIG_FILE"), help="Path to a structured YAML (or JSON) config file - see config_file.py's module docstring / config.example.yaml for the schema. Any explicit CLI flag below overrides the same setting from this file. Also settable via ABUS_CONFIG_FILE.")
-    p.add_argument("--camera", default=None, help="Name of the camera to run, from the config file's `cameras` list. Set automatically by the supervisor - only needed to run a single camera of a multi-camera config by hand.")
-    p.add_argument("--did", default=None, help="Optional DID to match, e.g. ABCD-123456-EFGHI")
-    p.add_argument("--password", default=None, help="Camera view password / security code (required, here or in the config file)")
-    p.add_argument("--bind-ip", default=None, help="Local IPv4 to bind the discovery socket to")
-    p.add_argument("--target-ip", default=None, help="Known camera IP on same LAN")
-    p.add_argument("--rtsp-bind-ip", default=config_file.DEFAULT_RTSP_BIND_IP, help="Address the RTSP server listens on. Default 0.0.0.0.")
-    p.add_argument("--rtsp-port", type=int, default=config_file.DEFAULT_RTSP_PORT, help="RTSP port; the stream is served at rtsp://<bind-ip>:<port>/abus. Default 8554.")
-    p.add_argument("--rtsp-loopback-port", type=int, default=None, help="Internal (set by the multi-camera config): listen on 127.0.0.1:PORT behind the RTSP gateway instead of the bind IP/port.")
-    p.set_defaults(rtsp_url=None)  # full public URL, only ever set per camera by the multi-camera config
-    p.add_argument("--timeout", type=float, default=5.0, help="Discovery timeout in seconds")
-    p.add_argument("--dump-raw", default=None, help="Write raw post-auth D0 frames to this file instead of ffmpeg (no ffmpeg required)")
-    p.add_argument("--resolution", type=int, default=ioctl.QUALITY_BY_SETTING, help="Video quality/resolution: 0=bySetting 1=fullHD 2=HD 3=SD 4=automatic (default 0, matches the real app's live-view screen)")
-    p.add_argument("--disable-audio", action="store_true", help="Disable serving the camera's audio (raw 8kHz mono PCM - confirmed live, despite the AAC we request via AUDIO_START) as a second RTP stream. Audio is served by default.")
-    p.add_argument("--disable-talkback", action="store_true", help="Disable two-way audio: by default RTSP clients that request the ONVIF audio backchannel (e.g. go2rtc/Frigate) can talk through the camera's speaker.")
-    p.add_argument("--skip-video-start", action="store_true", help="Test flag: never send IOCTRL_TYPE_VIDEO_START - full_capture4.pcap shows the real app never sends it either, video just starts automatically after auth")
-    p.add_argument("--skip-audio-start", action="store_true", help="Test flag: never send IOCTRL_TYPE_AUDIO_START - the first genuine real-app VIDEO_START session we captured (full_capture9.pcap) never sent it either")
-    p.add_argument("--debug", action="store_true", help="Log verbose per-packet/per-frame diagnostics (byte-resyncs, heartbeats, keyframe/duplicate-frame tracking, non-video datagrams). Off by default now that the protocol is stable.")
-    p.add_argument("--ptz-http-port", type=int, default=config_file.DEFAULT_PTZ_HTTP_PORT, help="Port for the PTZ REST server (GET/POST /ptz/<direction>?step=N). Default 8080.")
-    p.add_argument("--ptz-http-host", default=config_file.DEFAULT_PTZ_HTTP_HOST, help="Bind address for the PTZ REST server")
-    p.add_argument("--no-ptz-http", action="store_true", help="Disable the PTZ REST server")
-    p.add_argument("--onvif-port", type=int, default=config_file.DEFAULT_ONVIF_PORT, help="Port for the ONVIF device/media/PTZ SOAP service. Default 8000.")
-    p.add_argument("--no-onvif", action="store_true", help="Disable the ONVIF service entirely")
-    p.add_argument("--no-ws-discovery", action="store_true", help="Disable the WS-Discovery (UDP multicast) responder; the ONVIF HTTP service still runs, clients just need to be pointed at it manually")
-    p.add_argument("--onvif-ptz-step", type=int, default=2, help="How far one ONVIF ContinuousMove/RelativeMove call (e.g. one NVR PTZ button click) moves the camera, on our 1-16 step scale (camera is calibrated at ~34 steps for a full 270-degree horizontal sweep, ~16 steps for a full 90-degree vertical sweep). Default 2 (a modest nudge); raise it if clicks move too little, lower if they still move too far.")
-    p.add_argument("--auth-username", default=None, help="If set (together with --auth-password), require HTTP/RTSP Basic auth with this username on the RTSP stream, ONVIF service, and PTZ REST server. Unset (default) means none of them require auth.")
-    p.add_argument("--auth-password", default=None, help="Password for --auth-username - both or neither must be set")
-
-    # Pre-scan argv for --config so a file's settings can become the new argparse defaults
-    # BEFORE the real parse below - that way an explicit CLI flag still overrides the same
-    # setting from the file (argparse's normal set_defaults()-vs-explicit-arg precedence).
-    config_pre, _ = p.parse_known_args()
-    if config_pre.config:
-        try:
-            file_defaults = config_file.load_config(config_pre.config, camera=config_pre.camera)
-        except Exception as exc:
-            p.error(f"--config {config_pre.config!r}: {exc}")
-        p.set_defaults(**file_defaults)
-
-    args = p.parse_args()
-    rtsp_url = args.rtsp_url or f"rtsp://{args.rtsp_bind_ip}:{args.rtsp_port}/{config_file.DEFAULT_RTSP_PATH}"
-
-    if not args.password:
-        p.error("--password is required (via --password or the config file's camera.password)")
-    if bool(args.auth_username) != bool(args.auth_password):
-        p.error("--auth-username and --auth-password must be given together")
+    p.add_argument("--config", default=os.environ.get("ABUS_CONFIG_FILE"), help="Path to the YAML (or JSON) config file - see config_file.py's module docstring / config.example.yaml for the schema. Also settable via ABUS_CONFIG_FILE.")
+    p.add_argument("--camera", default=None, help="Internal: the camera (from the config's `cameras` list) this worker runs. Set by the supervisor.")
+    cli = p.parse_args()
+    if not cli.config:
+        p.error("--config (or ABUS_CONFIG_FILE) is required")
+    if not cli.camera:
+        p.error("--camera is required for a worker (the supervisor sets it)")
+    try:
+        args = argparse.Namespace(camera=cli.camera, **config_file.load_config(cli.config, cli.camera))
+    except Exception as exc:
+        p.error(f"--config {cli.config!r}: {exc}")
+    rtsp_url = args.rtsp_url
 
     logutil.set_debug(args.debug)
     logutil.set_prefix(args.camera)
@@ -176,12 +140,9 @@ def main() -> int:
         else:
             # read_stream() only requests video/audio once an RTSP client actually connects,
             # and stops it again when the last one disconnects - see read_stream() docstring.
-            bind_rtsp_url = rtsp_url
-            if args.rtsp_loopback_port:
-                parsed_rtsp = urllib.parse.urlsplit(rtsp_url)
-                bind_rtsp_url = urllib.parse.urlunsplit(parsed_rtsp._replace(netloc=f"127.0.0.1:{args.rtsp_loopback_port}"))
-            log(f"[rtsp] streaming to {rtsp_url}"
-                + (f" (internal worker port {bind_rtsp_url}, behind the RTSP gateway)" if args.rtsp_loopback_port else ""))
+            parsed_rtsp = urllib.parse.urlsplit(rtsp_url)
+            bind_rtsp_url = urllib.parse.urlunsplit(parsed_rtsp._replace(netloc=f"127.0.0.1:{args.rtsp_loopback_port}"))
+            log(f"[rtsp] streaming to {rtsp_url} (internal worker port {bind_rtsp_url}, behind the RTSP gateway)")
             session.read_stream(bind_rtsp_url, resolution=args.resolution,
                                  auth_username=args.auth_username, auth_password=args.auth_password,
                                  enable_audio=not args.disable_audio, gst_server_ref=gst_server_ref,
@@ -192,25 +153,19 @@ def main() -> int:
     return 0
 
 
-def _launch_multi_camera() -> Optional[list[tuple[str, list[str]]]]:
-    """If the config file defines a `cameras` list, start the shared REST gateway and return one
-    (label, extra argv) worker per camera; otherwise None (a single worker running the argv
-    unchanged)."""
+def _launch_cameras() -> list[tuple[str, list[str]]]:
+    """Start the shared RTSP and REST gateways and return one (label, extra argv) worker per camera
+    in the config file."""
     pre = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     pre.add_argument("--config", default=os.environ.get("ABUS_CONFIG_FILE"))
-    pre.add_argument("--camera")
     known, _ = pre.parse_known_args()
-    if not known.config or known.camera:
-        return None
+    if not known.config:
+        raise config_file.ConfigError("--config (or ABUS_CONFIG_FILE) is required")
     names = config_file.list_cameras(known.config)
-    if not names:
-        return None
-    gateway = config_file.rest_gateway_config(known.config)
-    if gateway:
-        start_rest_gateway(**gateway)
-    rtsp_gateway = config_file.rtsp_gateway_config(known.config)
-    if rtsp_gateway:
-        start_rtsp_gateway(**rtsp_gateway)
+    start_rtsp_gateway(**config_file.rtsp_gateway_config(known.config))
+    rest_gateway = config_file.rest_gateway_config(known.config)
+    if rest_gateway:
+        start_rest_gateway(**rest_gateway)
     return [(name, ["--camera", name]) for name in names]
 
 
@@ -224,7 +179,7 @@ if __name__ == "__main__":
             raise SystemExit(130)
     else:
         try:
-            worker_args = _launch_multi_camera()
+            worker_args = _launch_cameras()
         except Exception as exc:
             print(f"error: {exc}", file=sys.stderr)
             raise SystemExit(2)

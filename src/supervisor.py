@@ -69,11 +69,11 @@ class _WorkerRunner:
             child.wait()
 
 
-def supervise(worker_args: Optional[Sequence[tuple[str, list[str]]]] = None) -> int:
+def supervise(worker_args: Sequence[tuple[str, list[str]]]) -> int:
     """Run one supervised worker per entry of `worker_args` - (label, extra argv) pairs, each
-    appended to this process's own argv - or a single worker with the unchanged argv when
-    omitted. Returns 0 on a clean shutdown, or argparse's exit code 2 for a bad-usage worker."""
-    entries = list(worker_args) if worker_args else [("camera", [])]
+    appended to this process's own argv. Returns 0 on a clean shutdown, or argparse's exit code 2
+    for a bad-usage worker."""
+    entries = list(worker_args)
     base_argv = [sys.executable, str(Path(sys.argv[0]).resolve()), "--worker", *sys.argv[1:]]
     stop_all = threading.Event()
     runners = [_WorkerRunner(label, base_argv + extra, stop_all) for label, extra in entries]

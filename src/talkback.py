@@ -38,6 +38,12 @@ def talk_sample_rate(session) -> int:
     return 16000 if session.ov_serial else 8000
 
 
+def pcm_flush_unit(session) -> int:
+    """PCM byte count after which push_pcm() has sent everything it was given - a shorter tail
+    stays buffered (OV cameras encode 4:1 and only send once OV_SEND_BYTES have accumulated)."""
+    return OV_READ_BYTES * (OV_SEND_BYTES // (OV_READ_BYTES // 4)) if session.ov_serial else PCM_FRAME_BYTES
+
+
 class TalkbackController:
     """Thread-safe: push_pcm() is called from GStreamer streaming threads."""
 

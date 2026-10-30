@@ -4,7 +4,7 @@ the shared RTSP port and routes each connection by the first path segment of its
 routable request (rtsp://host:8554/<camera>/...) to that camera's worker, which only listens
 on loopback. After that first request the connection is a plain byte pipe, so the stream (RTP
 interleaved over RTSP/TCP), Basic auth and everything else are handled by the worker's own
-RTSP server exactly as in single-camera mode.
+RTSP server as if the client had connected to it directly.
 """
 from __future__ import annotations
 

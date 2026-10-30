@@ -1,34 +1,36 @@
-# Example structured YAML configuration for abus_rtsp_bridge.py (--config config.example.yaml
-# or ABUS_CONFIG_FILE=/path/to/this/file). Every section/key here is optional - anything you
-# omit keeps its normal command-line default. See src/config_file.py's module docstring for
-# the authoritative schema.
+# Example configuration for abus_rtsp_bridge.py (--config config.example.yaml or
+# ABUS_CONFIG_FILE=/path/to/this/file). Cameras are listed under `cameras` (at least one); the
+# other sections are shared by all of them. See src/config_file.py's module docstring for the
+# authoritative schema.
 #
 # A Home Assistant add-on's own /data/options.json also works as-is here (JSON is valid YAML).
 
-camera:
-  did: ABCD-012345-EFGHI
-  password: changeme
-  bind_ip: 192.168.1.10
-  target_ip: 192.168.1.64
-  timeout: 5.0
+cameras:
+  - name: front_door               # unique; letters, digits, _ and -; the stream is rtsp://<host>:8554/front_door
+    did: ABCD-012345-EFGHI         # did and/or target_ip is required when there are several cameras
+    password: changeme
+    # target_ip: 192.168.1.64
+    # bind_ip: 192.168.1.10
+    # timeout: 5.0                 # discovery seconds
+    onvif_port: 8000               # enables ONVIF for this camera on its own port (must be unique)
+    # onvif_ws_discovery: true     # optional, with onvif_port
+    # onvif_ptz_step: 2            # optional, with onvif_port
+    # resolution / disable_audio / disable_talkback: override the rtsp section for this camera
+  - name: garage
+    did: WXYZ-987654-ABCDE
+    password: garage-password
 
 rtsp:
   bind_ip: 0.0.0.0              # listen address
-  port: 8554                     # single-camera: rtsp://<host>:8554/abus
+  port: 8554                    # shared by all cameras, told apart by path
   resolution: 0
   disable_audio: false
-  disable_talkback: false         # two-way audio via the ONVIF RTSP backchannel
+  disable_talkback: false       # two-way audio via the ONVIF RTSP backchannel
 
 ptz:
   enabled: true
   http_host: 0.0.0.0
   http_port: 8080
-
-onvif:
-  enabled: true
-  ws_discovery: true
-  port: 8000
-  ptz_step: 2
 
 auth:
   username: null
@@ -40,19 +42,3 @@ diagnostics:
   skip_video_start: false
   skip_audio_start: false
 
-# Multiple cameras: uncomment and list them here. The sections above become defaults shared by
-# every camera, and each entry overrides them. Every camera needs a did and/or target_ip. All
-# cameras share the RTSP bind_ip/port from the rtsp section and are told apart by path:
-# rtsp://<host>:8554/<name>
-# ONVIF is configured per camera and is off unless the entry sets onvif_port; the root onvif
-# section above is ignored once cameras is set.
-# The REST API stays on the single ptz.http_port, e.g. http://<host>:8080/<name>/ptz/left
-# cameras:
-#   - name: front_door
-#     did: ABCD-012345-EFGHI
-#   - name: garage
-#     did: WXYZ-987654-ABCDE
-#     password: garage-password
-#     onvif_port: 8000          # enables ONVIF for this camera on its own port
-#     # onvif_ws_discovery: true  # optional, with onvif_port
-#     # onvif_ptz_step: 2         # optional, with onvif_port

@@ -20,72 +20,45 @@ detail; this file just covers what's here and how to run it.
 > receives contains the DID.
 
 ```bash
-python src/abus_rtsp_bridge.py --did <did> --password <password>
+python src/abus_rtsp_bridge.py --config config.yaml
 ```
 
-## Command-line arguments
+The bridge is configured only through one YAML (or JSON) file, given with `--config PATH` or
+`ABUS_CONFIG_FILE=PATH` - there are no per-setting command-line flags or environment variables.
+Run `python src/abus_rtsp_bridge.py -h` for the two options it does take.
 
-| Flag | Default | Description |
-|---|---|---|
-| `--config PATH` | none | Path to a structured YAML (or JSON) config file - see [YAML configuration file](#yaml-configuration-file) below. Also settable via `ABUS_CONFIG_FILE`. |
-| `--did` | none | DID to match (e.g. `ABCD-123456-EFGHI`). Optional on the LAN if `--target-ip` is given, but **required** for the P2P/WAN cloud fallback (see Docker examples below). |
-| `--password` | *(required)* | Camera view password / security code. |
-| `--bind-ip` | auto | Local IPv4 to bind the discovery socket to. |
-| `--target-ip` | none | Known camera IP on the same LAN - skips broadcast discovery and probes this address directly. |
-| `--rtsp-bind-ip` | `0.0.0.0` | Address the RTSP server listens on. |
-| `--rtsp-port` | `8554` | RTSP port; the stream is served at `rtsp://<bind-ip>:<port>/abus`. |
-| `--timeout` | `5.0` | Discovery timeout in seconds before falling back to P2P/WAN. |
-| `--resolution` | `0` | Video quality: `0`=bySetting `1`=fullHD `2`=HD `3`=SD `4`=automatic. |
-| `--disable-audio` | off | Disable the second (audio) RTP stream. Audio is served by default. |
-| `--disable-talkback` | off | Disable two-way audio (see [Two-way audio](#two-way-audio-talkback)). |
-| `--dump-raw PATH` | none | Diagnostic: write raw post-auth D0 frames to a file instead of streaming. |
-| `--skip-video-start` | off | Diagnostic: never send `IOCTRL_TYPE_VIDEO_START`. |
-| `--skip-audio-start` | off | Diagnostic: never send `IOCTRL_TYPE_AUDIO_START`. |
-| `--debug` | off | Verbose per-packet/per-frame diagnostic logging. |
-| `--ptz-http-port` | `8080` | Port for the PTZ REST server. |
-| `--ptz-http-host` | `0.0.0.0` | Bind address for the PTZ REST server. |
-| `--no-ptz-http` | off | Disable the PTZ REST server entirely. |
-| `--onvif-port` | `8000` | Port for the ONVIF device/media/PTZ SOAP service. |
-| `--no-onvif` | off | Disable the ONVIF service entirely. |
-| `--no-ws-discovery` | off | Keep the ONVIF SOAP service but skip the WS-Discovery multicast responder. |
-| `--onvif-ptz-step` | `2` | How far one ONVIF PTZ click moves the camera (1-16 raw step scale). |
-| `--auth-username` | none | Require HTTP/RTSP Basic auth on the RTSP stream, ONVIF service, and PTZ REST server. Must be set together with `--auth-password`. |
-| `--auth-password` | none | Password for `--auth-username`. |
+## Configuration
 
-Run `python src/abus_rtsp_bridge.py -h` for the exact, always-current list.
-
-## YAML configuration file
-
-Instead of (or alongside) individual flags/environment variables, every setting can be given
-as one structured YAML file via `--config PATH` or `ABUS_CONFIG_FILE=PATH` - grouped by
-topic rather than a flat list of `KEY: value` pairs. Any explicit CLI flag still overrides
-the same setting from the file. See [config.example.yaml](config.example.yaml) for a
-complete, runnable example; every section/key is optional:
+Every camera is an entry of the `cameras` list (at least one); the other sections are shared by
+all of them. See [config.example.yaml](config.example.yaml) for a complete, runnable example:
 
 ```yaml
-camera:
-  did: ABCD-123456-EFGHI
-  password: changeme
-  bind_ip: 192.168.1.10
-  target_ip: 192.168.1.64
-  timeout: 5.0
-rtsp:
-  bind_ip: 0.0.0.0              # single camera: rtsp://<host>:8554/abus
+cameras:
+  - name: front_door               # unique; letters, digits, _ and -
+    did: ABCD-012345-EFGHI         # did and/or target_ip is required when there are several cameras
+    password: changeme
+    # target_ip: 192.168.1.64      # skips broadcast discovery
+    # bind_ip: 192.168.1.10        # local IPv4 for the discovery socket
+    # timeout: 5.0                 # discovery seconds before the P2P/WAN fallback
+    # resolution / disable_audio / disable_talkback: override the rtsp defaults below
+    onvif_port: 8000               # ONVIF is off unless set; must be unique per camera
+    # onvif_ws_discovery: true     # optional, with onvif_port
+    # onvif_ptz_step: 2            # optional, with onvif_port
+  - name: garage
+    did: WXYZ-987654-ABCDE
+    password: garage-password
+rtsp:                              # shared
+  bind_ip: 0.0.0.0
   port: 8554
-  resolution: 0
+  resolution: 0                    # 0=bySetting 1=fullHD 2=HD 3=SD 4=automatic
   disable_audio: false
   disable_talkback: false
-ptz:
+ptz:                               # shared REST API
   enabled: true
   http_host: 0.0.0.0
   http_port: 8080
-onvif:
-  enabled: true
-  ws_discovery: true
-  port: 8000
-  ptz_step: 2
 auth:
-  username: null
+  username: null                   # both username+password must be set together, or neither
   password: null
 diagnostics:
   debug: false
@@ -94,54 +67,24 @@ diagnostics:
   skip_audio_start: false
 ```
 
-A typo in a section/key name is rejected with a clear error rather than silently ignored.
-This also makes wrapping the bridge in something that only speaks a single config file (e.g.
-a Home Assistant add-on) straightforward - a Home Assistant add-on's own `/data/options.json`
-works as-is too, since JSON is valid YAML.
+A typo in a section/key name is rejected with a clear error rather than silently ignored. A Home
+Assistant add-on's own `/data/options.json` works as-is too, since JSON is valid YAML.
 
-## Multiple cameras
+Each camera runs in its own supervised worker process (a crash in one never affects the others),
+and log lines are prefixed with the camera name. All cameras share one RTSP port, told apart by
+path, and one REST port, told apart by the first path segment; ONVIF is per camera:
 
-Add a `cameras` list to the config file to run several cameras from one process/container.
-The regular sections (`camera`, `rtsp`, `ptz`, `onvif`, `auth`, `diagnostics`) become defaults
-shared by every camera, and each list entry overrides them:
-
-```yaml
-camera:
-  password: shared-password        # used by every camera that doesn't set its own
-auth:
-  username: viewer
-  password: viewer-password
-cameras:
-  - name: front_door               # unique; letters, digits, _ and -
-    did: ABCD-012345-EFGHI
-  - name: garage
-    did: WXYZ-987654-ABCDE
-    password: garage-password      # optional per-camera overrides: bind_ip, target_ip, timeout,
-                                   # resolution, disable_audio, disable_talkback
-    onvif_port: 8000               # ONVIF is off unless set; must be unique per camera
-                                   # (also optional: onvif_ws_discovery, onvif_ptz_step)
-```
-
-Every camera needs a `did` and/or `target_ip`, so discovery can't pick the wrong camera. Each
-camera runs in its own supervised worker process (a crash in one never affects the others).
-All cameras share one RTSP port, told apart by path; ONVIF is off for a camera unless its entry
-sets `onvif_port`:
-
-| Service | Default |
+| Service | Address |
 |---|---|
 | RTSP | `rtsp://<host>:8554/<name>` (`rtsp.bind_ip`/`rtsp.port`, shared) |
-| ONVIF | disabled; set `onvif_port` on a camera to enable it on that port |
-| PTZ/snapshot/health REST | one shared server on `ptz.http_port` (default `8080`), see below |
+| PTZ/snapshot/health REST | `http://<host>:8080/<name>/...` (`ptz.http_host`/`ptz.http_port`, shared), see below |
+| ONVIF | `http://<host>:<onvif_port>`, only for cameras that set `onvif_port` |
 
 So the example above serves `rtsp://<host>:8554/front_door` and `rtsp://<host>:8554/garage`.
-Each camera that enables ONVIF needs its own, unique `onvif_port`, and can also set
-`onvif_ws_discovery` and `onvif_ptz_step`. The root `onvif` section is ignored in multi-camera
-mode. Duplicate
-DIDs/ONVIF ports are
-rejected at startup. Log lines are prefixed with the camera name.
+Duplicate names, DIDs and ONVIF ports are rejected at startup.
 
-**One REST server for all cameras**: the REST API is served once, on `ptz.http_host`/
-`ptz.http_port`, with the camera name as the first path segment:
+**One REST server for all cameras**: the REST API is served once, with the camera name as the
+first path segment:
 
 ```bash
 curl http://<host>:8080/garage/ptz/left?step=4
@@ -150,23 +93,19 @@ curl http://<host>:8080/cameras        # list camera names
 curl http://<host>:8080/health         # worst status across all cameras (503 if any is unhealthy)
 ```
 
-Everything under `/<camera>/` is the single-camera API described below (`/ptz/...`, `/light/...`,
-`/siren/...`, `/snapshot`, `/health`, `/directions`). The shared `auth` credentials apply (except
-to `/health` and `/<camera>/health`). Each camera's own REST server only listens on loopback
-(`ptz.http_port` + 1 + N) and is not meant to be used directly. The Docker health check and the
-add-on watchdog use the aggregated `/health`. ONVIF stays per camera.
-
-Notes: in multi-camera mode, CLI flags apply to **every** camera and override the file, so keep
-per-camera settings (DID, password, ports) in the config file. `--camera NAME` runs a single
-camera from such a file by hand. With the Docker bridge network, publish every port you use.
+Everything under `/<camera>/` is the per-camera API described below (`/ptz/...`, `/light/...`,
+`/siren/...`, `/snapshot`, `/audio`, `/health`, `/directions`). The shared `auth` credentials
+apply (except to `/health` and `/<camera>/health`). Each camera's own REST and RTSP servers
+only listen on loopback (`ptz.http_port` + 1 + N and `rtsp.port` + 1 + N for camera number N,
+counting from 0) and are not meant to be used directly. The Docker health check uses the
+aggregated `/health`.
 
 ## Running with Docker
 
 Image: [`gimparm/abus-rtsp-bridge:latest`](https://hub.docker.com/r/gimparm/abus-rtsp-bridge).
 The container is configured only through the YAML file described above: mount it at
 `/config/config.yaml`, or point `ABUS_CONFIG_FILE` at another path (see
-[config.example.yaml](config.example.yaml)). Anything passed after the image name on
-`docker run` is forwarded as extra CLI args.
+[config.example.yaml](config.example.yaml)).
 
 **Local LAN discovery** (`--network host`) - needed because UDP broadcast discovery must see
 the camera's physical LAN segment directly, which only works on a real Linux host (bare
@@ -182,9 +121,9 @@ docker run --rm --network host \
 
 **P2P/WAN cloud fallback** - for everywhere else (Docker Desktop, a container not on the
 camera's LAN/VLAN, a cloud/remote host, etc.). No special networking is needed; just publish
-the ports you want reachable. `camera.did` is **required** here (the cloud rendezvous lookup
-is keyed by it) - LAN discovery is tried first and simply times out after `camera.timeout`
-seconds before falling back automatically:
+the ports you want reachable. Each camera's `did` is **required** here (the cloud rendezvous
+lookup is keyed by it) - LAN discovery is tried first and simply times out after the camera's
+`timeout` seconds before falling back automatically:
 
 ```bash
 docker run --rm \
@@ -198,26 +137,27 @@ Also publish each camera's `onvif_port` if you enabled ONVIF (e.g. `-p 8000:8000
 ## PTZ control (REST)
 
 If the camera supports pan/tilt, a lightweight REST server (stdlib `http.server`, no extra
-dependencies) starts alongside the RTSP stream at `http://0.0.0.0:8080` by default:
+dependencies) starts alongside the RTSP stream at `http://0.0.0.0:8080` by default. Every
+route below lives under the camera's name, e.g. `/garage/ptz/up`:
 
 ```bash
-curl http://<host>:8080/ptz/up                # move up, default step
-curl http://<host>:8080/ptz/left?step=8        # move left, bigger step
-curl http://<host>:8080/ptz/stop
-curl http://<host>:8080/directions             # list valid direction names
+curl http://<host>:8080/<camera>/ptz/up                # move up, default step
+curl http://<host>:8080/<camera>/ptz/left?step=8        # move left, bigger step
+curl http://<host>:8080/<camera>/ptz/stop
+curl http://<host>:8080/<camera>/directions             # list valid direction names
 ```
 
 Directions: `up`, `down`, `left`, `right`, `left_up`, `left_down`, `right_up`, `right_down`,
 `stop`, `auto_scan`, `calibration`. This is IOCTRL type 9 - a single discrete "move N steps"
 command per call, the same one the real app sends once per axis on swipe-release (not a
-continuous joystick). Use `--ptz-http-port`/`--ptz-http-host` to change the bind address, or
-`--no-ptz-http` to disable it.
+continuous joystick). Use `ptz.http_host`/`ptz.http_port` to change the bind address, or
+`ptz.enabled: false` to disable it.
 
 If the camera supports saved PTZ presets (the app's 3 position buttons), you can move to
 one:
 
 ```bash
-curl http://<host>:8080/ptz/preset/0     # go to saved position 0 (valid: 0, 1, 2)
+curl http://<host>:8080/<camera>/ptz/preset/0     # go to saved position 0 (valid: 0, 1, 2)
 ```
 
 This is the same IOCTRL type 9 channel, sub-command 12 (`IOCTRL_PTZ_PRESET_POINT`).
@@ -228,7 +168,7 @@ easier done from the app itself.
 The same REST server also serves a snapshot of the current video frame:
 
 ```bash
-curl http://<host>:8080/snapshot -o snapshot.jpg
+curl http://<host>:8080/<camera>/snapshot -o snapshot.jpg
 ```
 
 This is captured server-side from the live decoded video (a GStreamer `tee` right after
@@ -243,19 +183,22 @@ If the camera has a built-in siren or spotlight/floodlight, the same REST server
 trigger them (fire-and-forget, no status feedback - matching the rest of this API):
 
 ```bash
-curl http://<host>:8080/siren/on
-curl http://<host>:8080/siren/off
-curl http://<host>:8080/light/on
-curl http://<host>:8080/light/off
+curl http://<host>:8080/<camera>/siren/on
+curl http://<host>:8080/<camera>/siren/off
+curl http://<host>:8080/<camera>/light/on
+curl http://<host>:8080/<camera>/light/off
 ```
 
 ## Health check
 
 `GET /health` on the same REST server (never Basic-auth-gated, unlike every other route
-above - it exposes no control surface or video) reports liveness/readiness as JSON:
+above - it exposes no control surface or video) reports liveness/readiness as JSON. Without a
+camera name it aggregates all cameras (worst status wins, per-camera detail under `cameras`);
+`/<camera>/health` reports one camera:
 
 ```bash
 curl http://<host>:8080/health
+curl http://<host>:8080/<camera>/health
 ```
 
 `status` is one of `starting` (still discovering/authenticating with the camera - this
@@ -288,11 +231,29 @@ the RTSP source URL, e.g. `rtsp://<host>:8554/<camera>#backchannel=1`. A backcha
 pipeline, so expect roughly double the CPU while it is connected. Turn the feature off with
 `rtsp.disable_talkback: true` (or per camera `disable_talkback`).
 
+### Playing an audio file (REST)
+
+`POST /audio?audio=<url>` downloads an audio file (mp3, or anything GStreamer can decode) and plays
+it on the camera's speaker through the same talk path - no RTSP client needed:
+
+```bash
+curl -X POST "http://<host>:8080/<camera>/audio?audio=http://example.com/doorbell.mp3"
+```
+
+The file is fetched and decoded before the request is answered, so a bad URL or an undecodable
+file gives an error (`400` not an http(s) URL, `413` too large - 10 MB / 3 minutes max, `422` can't
+be decoded, `502` download failed); on success the answer is `202` with the clip length and
+playback continues in the background. Only one clip plays at a time per camera (`409` otherwise,
+`503` while the camera session is still being established). The download is made by the bridge
+itself, so enable `auth` if the REST port is reachable by anything you don't trust. This works
+independently of `disable_talkback`, which only controls the RTSP backchannel.
+
 ## PTZ control (ONVIF)
 
 A minimal ONVIF Profile S-ish device (`src/onvif_server.py`, no third-party ONVIF/SOAP
-library) also starts by default at `http://<lan-ip>:8000`, for NVRs/clients that expect
-ONVIF specifically (e.g. Synology Surveillance Station, Blue Iris, ONVIF Device Manager):
+library) is available for each camera that sets `onvif_port` (at `http://<lan-ip>:<onvif_port>`),
+for NVRs/clients that expect ONVIF specifically (e.g. Synology Surveillance Station, Blue Iris,
+ONVIF Device Manager). Add each camera to your NVR as its own ONVIF device:
 
 - WS-Discovery (UDP multicast `239.255.255.250:3702`) so clients can auto-discover it.
 - Device service (`/onvif/device_service`): GetDeviceInformation, GetCapabilities,
@@ -301,7 +262,7 @@ ONVIF specifically (e.g. Synology Surveillance Station, Blue Iris, ONVIF Device 
   GetStreamUri (returns this bridge's real RTSP URL).
 - PTZ service (`/onvif/ptz_service`): GetNodes/GetNode, GetConfigurations/GetConfiguration,
   ContinuousMove, RelativeMove, Stop, GetStatus, GetPresets, GotoPreset (3 fixed slots `0`-`2`,
-  matching the app's own 3 saved-position buttons and the REST `/ptz/preset/<0-2>` above -
+  matching the app's own 3 saved-position buttons and the REST `/<camera>/ptz/preset/<0-2>` above -
   SetPreset isn't implemented, same reasoning as the REST API).
 
 **Limitation**: the camera's own protocol only supports a discrete "move N steps" command,
@@ -311,11 +272,11 @@ not a real "move until told to stop" primitive - so each ONVIF `ContinuousMove`/
 vector's own magnitude, since real-world PTZ clients like Frigate send full velocity on
 every click regardless of intended distance), and `Stop` is a no-op. NVR UIs that repeat
 `ContinuousMove` while a directional button is held still get a reasonable "keep moving"
-experience out of this. Auth is HTTP Basic (see below), same credentials as RTSP/REST. Use
-`--onvif-port` to change the port, `--no-onvif` to disable it entirely, or
-`--no-ws-discovery` to keep the SOAP service but skip the multicast responder.
+experience out of this. Auth is HTTP Basic (see below), same credentials as RTSP/REST. Set
+`onvif_ws_discovery: false` on a camera to keep its SOAP service but skip the multicast
+responder.
 
-Each click moves the camera by `--onvif-ptz-step` (default 2) on the camera's own 1-16 raw
+Each click moves the camera by `onvif_ptz_step` (default 2) on the camera's own 1-16 raw
 step scale. Calibrated against this camera's manufacturer spec (270° horizontal / 90°
 vertical travel): ~34 raw steps = one full horizontal sweep (~7.9°/step), ~16 raw steps =
 one full vertical sweep (~5.6°/step) - so the default is roughly a 16° horizontal / 11°

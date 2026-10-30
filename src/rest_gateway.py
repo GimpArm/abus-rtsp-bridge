@@ -78,7 +78,8 @@ class _GatewayHandler(http.server.BaseHTTPRequestHandler):
         request = urllib.request.Request(url, data=self.rfile.read(length) if length else None,
                                          method=self.command, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=10) as resp:
+            # Long enough for POST /audio, which downloads and decodes the file before answering.
+            with urllib.request.urlopen(request, timeout=60) as resp:
                 self._reply_raw(resp.status, resp.headers.get("Content-Type"), resp.read())
         except urllib.error.HTTPError as exc:
             self._reply_raw(exc.code, exc.headers.get("Content-Type"), exc.read())

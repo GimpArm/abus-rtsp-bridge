@@ -76,6 +76,9 @@ class CameraSession:
         # Model string from the camera's DEVINFO response (None until it arrives).
         self.device_model: Optional[str] = None
         self._talk_lock = threading.Lock()
+        # One controller for every audio source (RTSP backchannel, REST /audio) so only one
+        # of them opens/closes the camera's speaker at a time.
+        self.talkback = talkback.TalkbackController(self)
         self._ioctl_lock = threading.Lock()
         self._last_ioctl_time = 0.0
         # Health-check state (see /health in ptz_rest_api.py) - "discovered"/"authed" are
@@ -339,7 +342,7 @@ class CameraSession:
         # --- P2P CLOUD FALLBACK SERVICE CHANNEL ---
         log("[discover] Local LAN search timed out. Engaging P2P Cloud Fallback Engine...")
         if not self.did:
-            log("[discover] Error: P2P fallback requires a valid --did input parameter string.")
+            log("[discover] Error: P2P fallback requires the camera's did to be set in the config.")
             return False
 
         uid_bytes = wire.encode_did(self.did)
@@ -831,7 +834,7 @@ class CameraSession:
 
         def _on_client_disconnect() -> None:
             nonlocal is_streaming, disconnect_timer, disconnect_generation
-            if talk is not None:
+            if enable_talkback:
                 talk.stop()
             if not is_streaming:
                 return
@@ -854,14 +857,14 @@ class CameraSession:
         # Two-way audio: RTSP clients that ask for the ONVIF backchannel send audio that ends up
         # here (see talkback.py); the camera's own audio is muted while the speaker is open, like
         # the app does for models without bidirectional intercom, to avoid feedback.
-        talk = talkback.TalkbackController(self) if enable_talkback else None
+        talk = self.talkback
         server = gst_rtsp_server.GstAbusRtspServer(
             sps_nal=frame_reassembler.H264_SPS[4:], pps_nal=frame_reassembler.H264_PPS[4:],
             host=rtsp_host, port=rtsp_port, path=rtsp_path,
             enable_audio=enable_audio, audio_sample_rate=self.audio_sample_rate,
             auth_username=auth_username, auth_password=auth_password,
             on_first_client_connect=_on_client_connect, on_last_client_disconnect=_on_client_disconnect,
-            enable_talkback=enable_talkback, on_talk_audio=talk.push_pcm if talk else None,
+            enable_talkback=enable_talkback, on_talk_audio=talk.push_pcm if enable_talkback else None,
             talk_sample_rate=talkback.talk_sample_rate(self),
         )
         try:
@@ -1064,7 +1067,7 @@ class CameraSession:
                                         payload = audio_utils.upsample_2x(payload)
                                 # The app drops the camera's audio while the speaker is open unless
                                 # the model can do both at once (P2PDev.dropAudioData).
-                                if talk is not None and talk.active and not self.bidirectional_intercom:
+                                if talk.active and not self.bidirectional_intercom:
                                     continue
                                 if not seen_real_audio:
                                     seen_real_audio = True

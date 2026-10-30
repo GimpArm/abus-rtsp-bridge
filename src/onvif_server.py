@@ -217,7 +217,7 @@ def _pan_tilt_to_direction_step(x: float, y: float, max_step: int = 2) -> tuple[
     Calibrated against the camera's own manufacturer spec (270 deg horizontal / 90 deg
     vertical) and live testing: 34 raw steps = a full horizontal sweep, 16 raw steps = a full
     vertical sweep - so max_step=2 is a modest ~16 deg horizontal / ~11 deg vertical nudge per
-    call, not a big turn. Tune via OnvifConfig.max_step_per_move / --onvif-ptz-step."""
+    call, not a big turn. Tune via OnvifConfig.max_step_per_move / the camera's onvif_ptz_step."""
     horiz = "left" if x < -0.05 else "right" if x > 0.05 else None
     vert = "up" if y > 0.05 else "down" if y < -0.05 else None
     step = max(1, min(max_step, round(max(abs(x), abs(y)) * max_step)))
