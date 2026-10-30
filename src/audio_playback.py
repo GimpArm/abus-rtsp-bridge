@@ -49,8 +49,11 @@ def _fetch(url: str) -> bytes:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise AudioError(400, "audio must be an http:// or https:// URL")
+    # Many hosts/CDNs answer urllib's default "Python-urllib" User-Agent with 403.
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (abus-rtsp-bridge)",
+                                                   "Accept": "audio/*,*/*;q=0.8"})
     try:
-        with urllib.request.urlopen(url, timeout=FETCH_TIMEOUT_S) as resp:
+        with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT_S) as resp:
             data = resp.read(MAX_DOWNLOAD_BYTES + 1)
     except (OSError, ValueError) as exc:
         raise AudioError(502, f"could not download audio: {exc}") from exc
