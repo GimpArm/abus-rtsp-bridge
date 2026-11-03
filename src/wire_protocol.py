@@ -52,6 +52,10 @@ MSG_ACK = 0xD1
 
 CHANNEL_AUTH = 1
 CHANNEL_IOCTL = 4
+# Client-initiated "please start auth" (P2PDev.sendAuthRequest_outer, stream IO type 6) - the
+# app sends this right after connecting to OV-serial (CO/DO) cameras, which otherwise never
+# send their challenge.
+CHANNEL_AUTH_REQUEST = 6
 CHANNEL_REALTIME_AV = 1  # DRW header's channel byte (parse_drw_header) - distinct namespace
 # from the old 8-byte model's CHANNEL_AUTH/IOCTL subtype field despite the same value 1;
 # confirmed via capture analysis: this is the realtime audio/video data channel specifically.
@@ -196,13 +200,11 @@ def build_drw_data(channel: int, seq: int, payload: bytes) -> bytes:
     return build_f1(MSG_DATA, bytes([0xD1, channel & 0xFF]) + struct.pack(">H", seq & 0xFFFF) + payload)
 
 
-def build_ack(ack_id: int) -> bytes:
-    # Verified against ~2100 client ack packets across full_capture4.pcap: the 3-byte field
-    # right after the 0xD1 tag is NOT a sequence number at all (our earlier "next_seq" reading
-    # was wrong) - its low byte is always exactly the COUNT of 2-byte ack-ids that follow, and
-    # the upper 2 bytes are a fixed 0x0100 marker (0x0000 only in the first couple of acks of
-    # a session). i.e. the field is really `0x010000 | ack_count`, not a running sequence.
-    body = bytes([0xD1]) + (0x010000 | 1).to_bytes(3, "big") + (ack_id & 0xFFFF).to_bytes(2, "big")
+def build_ack(channel: int, seq: int) -> bytes:
+    """Ack one DRW packet (cs2p2p_PPPP_DRWAck_Write_Header): 0xD1 tag, channel, BE16 count,
+    then the BE16 seq of each acked packet. The 0x0000 prefix seen in the first acks of a
+    captured session is channel 0 (auth/IOCTL), the later 0x0100 prefix is channel 1 (AV)."""
+    body = bytes([0xD1, channel & 0xFF]) + struct.pack(">HH", 1, seq & 0xFFFF)
     return build_f1(MSG_ACK, body)
 
 

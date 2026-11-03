@@ -40,11 +40,12 @@ cameras:
     # target_ip: 192.168.1.64      # skips broadcast discovery
     # bind_ip: 192.168.1.10        # local IPv4 for the discovery socket
     # timeout: 5.0                 # discovery seconds before the P2P/WAN fallback
-    # resolution / disable_audio / disable_talkback: override the rtsp defaults below
+    # resolution / disable_audio / disable_talkback / keep_stream_open: override the rtsp defaults below
     onvif_port: 8000               # ONVIF is off unless set; must be unique per camera
     # onvif_ws_discovery: true     # optional, with onvif_port
     # onvif_ptz_step: 2            # optional, with onvif_port
   - name: garage
+    # disabled: true               # skip this camera without removing it (default false)
     did: WXYZ-987654-ABCDE
     password: garage-password
 rtsp:                              # shared
@@ -53,6 +54,7 @@ rtsp:                              # shared
   resolution: 0                    # 0=bySetting 1=fullHD 2=HD 3=SD 4=automatic
   disable_audio: false
   disable_talkback: false
+  keep_stream_open: false          # true: keep the camera streaming after the last RTSP client leaves
 ptz:                               # shared REST API
   enabled: true
   http_host: 0.0.0.0

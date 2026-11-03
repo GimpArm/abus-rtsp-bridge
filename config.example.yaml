@@ -15,8 +15,9 @@ cameras:
     onvif_port: 8000               # enables ONVIF for this camera on its own port (must be unique)
     # onvif_ws_discovery: true     # optional, with onvif_port
     # onvif_ptz_step: 2            # optional, with onvif_port
-    # resolution / disable_audio / disable_talkback: override the rtsp section for this camera
+    # resolution / disable_audio / disable_talkback / keep_stream_open: override the rtsp section for this camera
   - name: garage
+    # disabled: true               # skip this camera without removing it
     did: WXYZ-987654-ABCDE
     password: garage-password
 
@@ -26,6 +27,7 @@ rtsp:
   resolution: 0
   disable_audio: false
   disable_talkback: false       # two-way audio via the ONVIF RTSP backchannel
+  keep_stream_open: false       # keep the camera streaming after the last RTSP client disconnects
 
 ptz:
   enabled: true

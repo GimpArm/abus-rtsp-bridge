@@ -146,7 +146,8 @@ def main() -> int:
             session.read_stream(bind_rtsp_url, resolution=args.resolution,
                                  auth_username=args.auth_username, auth_password=args.auth_password,
                                  enable_audio=not args.disable_audio, gst_server_ref=gst_server_ref,
-                                 enable_talkback=not args.disable_talkback)
+                                 enable_talkback=not args.disable_talkback,
+                                 keep_stream_open=args.keep_stream_open)
     finally:
         session.close()
 

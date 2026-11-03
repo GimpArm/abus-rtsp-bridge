@@ -11,7 +11,8 @@ Schema (see config.example.yaml for a complete example):
         did: ABCD-123456-EFGHI     # did and/or target_ip is required per camera when there are several
         password: secret           # required
         # optional: bind_ip, target_ip, timeout (discovery seconds, default 5), resolution,
-        #           disable_audio, disable_talkback (these three default to the rtsp section)
+        #           disable_audio, disable_talkback, keep_stream_open (these default to the rtsp section)
+        # disabled: true skips the camera entirely (default false)
         # ONVIF is off for a camera unless onvif_port is set (unique per camera); then optionally
         # onvif_ws_discovery (default true) and onvif_ptz_step (default 2):
         # onvif_port: 8000
@@ -21,6 +22,7 @@ Schema (see config.example.yaml for a complete example):
       resolution: 0                # 0=bySetting 1=fullHD 2=HD 3=SD 4=automatic
       disable_audio: false
       disable_talkback: false      # true == no ONVIF RTSP audio backchannel
+      keep_stream_open: false      # true == keep the camera streaming after the last RTSP client leaves
     ptz:                           # shared REST API (served as /<camera name>/ptz/<direction> etc.)
       enabled: true
       http_host: 0.0.0.0
@@ -57,13 +59,14 @@ DEFAULT_PTZ_HTTP_PORT = 8080
 
 _CAMERA_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _CAMERA_KEYS = frozenset({"did", "password", "bind_ip", "target_ip", "timeout",
-                          "resolution", "disable_audio", "disable_talkback", "onvif_port",
-                          "onvif_ws_discovery", "onvif_ptz_step"})
+                          "resolution", "disable_audio", "disable_talkback", "keep_stream_open",
+                          "onvif_port", "onvif_ws_discovery", "onvif_ptz_step", "disabled"})
 
 # Every setting a worker reads, with the value used when the config doesn't set it.
 _DEFAULTS: dict[str, Any] = {
     "did": None, "password": None, "bind_ip": None, "target_ip": None, "timeout": 5.0,
     "resolution": ioctl.QUALITY_BY_SETTING, "disable_audio": False, "disable_talkback": False,
+    "keep_stream_open": False,
     "rtsp_bind_ip": DEFAULT_RTSP_BIND_IP, "rtsp_port": DEFAULT_RTSP_PORT,
     "no_ptz_http": False, "ptz_http_host": DEFAULT_PTZ_HTTP_HOST, "ptz_http_port": DEFAULT_PTZ_HTTP_PORT,
     "no_onvif": True, "onvif_port": None, "no_ws_discovery": False, "onvif_ptz_step": 2,
@@ -80,7 +83,8 @@ class ConfigError(ValueError):
 _FIELDS: dict[str, list[tuple[str, str, bool]]] = {
     "rtsp": [("bind_ip", "rtsp_bind_ip", False), ("port", "rtsp_port", False),
              ("resolution", "resolution", False),
-             ("disable_audio", "disable_audio", False), ("disable_talkback", "disable_talkback", False)],
+             ("disable_audio", "disable_audio", False), ("disable_talkback", "disable_talkback", False),
+             ("keep_stream_open", "keep_stream_open", False)],
     "ptz": [("enabled", "no_ptz_http", True), ("http_host", "ptz_http_host", False),
             ("http_port", "ptz_http_port", False)],
     "auth": [("username", "auth_username", False), ("password", "auth_password", False)],
@@ -135,8 +139,9 @@ def _require_unique(label: str, values: dict[str, Any]) -> None:
 
 
 def _resolve_cameras(raw: dict[str, Any], shared: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Merge defaults, shared settings and each `cameras` entry into one flat settings dict per
-    camera (name -> dict keyed like _DEFAULTS) and reject anything invalid or colliding. ONVIF is
+    """Merge defaults, shared settings and each enabled `cameras` entry into one flat settings dict
+    per camera (name -> dict keyed like _DEFAULTS) and reject anything invalid or colliding.
+    Entries with `disabled: true` are skipped. ONVIF is
     off unless the entry sets `onvif_port`. Each camera's own REST and RTSP servers are moved to
     loopback ports (`ptz_http_port`, `rtsp_loopback_port`) behind rest_gateway.py/rtsp_gateway.py."""
     entries = raw.get("cameras")
@@ -146,6 +151,7 @@ def _resolve_cameras(raw: dict[str, Any], shared: dict[str, Any]) -> dict[str, d
         raise ConfigError("auth.username and auth.password must be given together")
 
     cameras: dict[str, dict[str, Any]] = {}
+    names: set[str] = set()
     base = {**_DEFAULTS, **shared}
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
@@ -153,13 +159,17 @@ def _resolve_cameras(raw: dict[str, Any], shared: dict[str, Any]) -> dict[str, d
         name = entry.get("name")
         if not isinstance(name, str) or not _CAMERA_NAME_RE.match(name):
             raise ConfigError(f"cameras[{index}].name is required and may only contain letters, digits, '_' and '-'")
-        if name in cameras:
+        if name in names:
             raise ConfigError(f"duplicate camera name '{name}'")
+        names.add(name)
         unknown_keys = set(entry) - _CAMERA_KEYS - {"name"}
         if unknown_keys:
             raise ConfigError(f"unknown key(s) in camera '{name}': {', '.join(sorted(unknown_keys))}")
+        if entry.get("disabled"):
+            continue
 
-        overrides = {key: value for key, value in entry.items() if key != "name" and value is not None}
+        overrides = {key: value for key, value in entry.items()
+                     if key not in ("name", "disabled") and value is not None}
         settings = {**base, **{k: v for k, v in overrides.items() if k != "onvif_ws_discovery"}}
         if not settings["password"]:
             raise ConfigError(f"camera '{name}' needs a password")
@@ -172,6 +182,8 @@ def _resolve_cameras(raw: dict[str, Any], shared: dict[str, Any]) -> dict[str, d
             settings["no_ws_discovery"] = not overrides["onvif_ws_discovery"]
         cameras[name] = settings
 
+    if not cameras:
+        raise ConfigError("all cameras are disabled - enable at least one")
     if len(cameras) > 1:
         for name, settings in cameras.items():
             if not settings["did"] and not settings["target_ip"]:

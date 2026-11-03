@@ -64,9 +64,11 @@ class CameraSession:
         self.camera_ip: Optional[str] = None
         self.camera_port: int = wire.CAMERA_PORT
         self.local_seq = 0
-        self.ack_id = 0
         self.session_key: Optional[bytes] = None
         self.last_video_stop_time = 0.0
+        # Datagrams alive_handshake() received that belong to the auth exchange (e.g. an early
+        # challenge) - replayed by auth() instead of being dropped.
+        self._pending_datagrams: List[Tuple[bytes, Tuple[str, int]]] = []
         # Two-way audio: own DRW sequence space for the client -> device AV channel, plus a
         # counter bumped on every reconnect() so talkback.py can tell its intercom was started
         # on a session that no longer exists. send_ioctl() is also reachable from the
@@ -128,8 +130,8 @@ class CameraSession:
             return
         self.sock.sendto(frame, dest)
 
-    def _send_auth(self, auth_type: int, payload: bytes = b"") -> None:
-        frame = wire.build_d0(self.local_seq, wire.CHANNEL_AUTH, wire.build_auth_head(auth_type, payload))
+    def _send_auth(self, auth_type: int, payload: bytes = b"", stream_type: int = wire.CHANNEL_AUTH) -> None:
+        frame = wire.build_d0(self.local_seq, stream_type, wire.build_auth_head(auth_type, payload))
         self.local_seq += 1
         self._send(frame)
 
@@ -285,12 +287,11 @@ class CameraSession:
         self.send_ioctl(188, bytes(8))
         self.send_ioctl(180, bytes(8))
 
-    def _ack(self) -> None:
-        # Used by auth()/dump_stream() only - simple, proven, unbatched. The video hot loop in
+    def _ack(self, channel: int, seq: int) -> None:
+        # Used by auth()/dump_stream() only - simple, unbatched. The video hot loop in
         # read_stream() uses the batched _enqueue_ack()/_flush_acks() pair instead (see there
         # for the batching cadence and why).
-        self._send(wire.build_ack(self.ack_id))
-        self.ack_id += 1
+        self._send(wire.build_ack(channel, seq))
 
     def discover(self, target_ip: Optional[str] = None, timeout: float = 5.0) -> bool:
         """
@@ -487,17 +488,21 @@ class CameraSession:
         if not self.camera_ip or not self.did:
             return
         payload = wire.encode_did(self.did)
+        self._pending_datagrams.clear()
         deadline = time.time() + timeout
         while time.time() < deadline:
             self._send(wire.build_f1(wire.MSG_ALIVE_REQ, payload))
             try:
-                data, _ = self.sock.recvfrom(4096)
+                data, addr = self.sock.recvfrom(65535)
             except (socket.timeout, ConnectionResetError, OSError):
                 continue
             parsed = wire.parse_f1(data)
             if parsed and parsed[0] == wire.MSG_ALIVE_ACK:
                 log("[alive] camera acknowledged session")
                 return
+            if parsed and parsed[0] == wire.MSG_DATA:
+                self._pending_datagrams.append((data, addr))
+        log(f"[alive] no alive ack from the camera within {timeout:.0f}s - continuing anyway")
 
     def auth(self, timeout: float = 10.0) -> bool:
         """Complete the AES challenge/response handshake over the F1/D0 reliable channel.
@@ -513,40 +518,70 @@ class CameraSession:
         self.camera_ip/self.camera_port, not how they were discovered, so the exact same
         challenge/response the LAN path already uses works unchanged over a P2P-resolved
         address too - there is no separate "P2P auth" to bypass into.
-        """
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                data, _ = self.sock.recvfrom(65535)
-            except (socket.timeout, ConnectionResetError, OSError):
-                continue
 
+        OV-serial cameras (DID prefix CO/DO) only send their challenge after the client asks
+        for it (P2PDevOVSeriesOpt.myDoConnectAfterConnected -> sendAuthRequest_outer), so the
+        request is sent up front for those, and as a fallback for any camera that stays silent.
+        """
+        log(f"[auth] did={self.did} camera={self.camera_ip}:{self.camera_port} ov_serial={self.ov_serial}")
+        received: dict = {}
+        got_challenge = False
+        start = time.time()
+        next_auth_request = start if self.ov_serial else start + 5.0
+        deadline = start + timeout
+        while time.time() < deadline:
+            if not got_challenge and time.time() >= next_auth_request:
+                reason = "OV-serial camera" if self.ov_serial else f"no challenge after {time.time() - start:.0f}s"
+                log(f"[auth] sending auth request ({reason})")
+                self._send_auth(0, b"", stream_type=wire.CHANNEL_AUTH_REQUEST)
+                next_auth_request = time.time() + 3.0
+
+            if self._pending_datagrams:
+                data, addr = self._pending_datagrams.pop(0)
+            else:
+                try:
+                    data, addr = self.sock.recvfrom(65535)
+                except (socket.timeout, ConnectionResetError, OSError):
+                    continue
+
+            if addr != (self.camera_ip, self.camera_port):
+                self._count_auth_packet(received, f"from other address {addr[0]}:{addr[1]}")
+                continue
             parsed = wire.parse_f1(data)
             if not parsed:
+                self._count_auth_packet(received, "non-F1", f"{len(data)} bytes: {data[:16].hex()}")
                 continue
             msg_type, body = parsed
+            self._count_auth_packet(received, f"0x{msg_type:02x}")
 
             if msg_type == wire.MSG_PING:
                 self._send(wire.build_f1(wire.MSG_PONG))
                 continue
-            if msg_type in (wire.MSG_PONG, wire.MSG_ALIVE_REQ, wire.MSG_ALIVE_ACK, wire.MSG_ACK):
+            if msg_type == wire.MSG_STREAM_END:
+                log("[auth] camera closed the session (0xF0) during the handshake")
                 continue
             if msg_type != wire.MSG_DATA:
                 continue
 
+            drw = wire.parse_drw_header(body)
             d0 = wire.parse_d0(body)
-            if not d0:
+            if not drw or not d0:
+                self._count_auth_packet(received, "malformed D0", body[:16].hex())
                 continue
-            self._ack()
+            self._ack(drw[0], drw[1])
             if d0["subtype"] != wire.CHANNEL_AUTH:
+                self._count_auth_packet(received, f"D0 stream type {d0['subtype']} (not auth)",
+                                        f"channel={drw[0]} seq={drw[1]} {body[:24].hex()}")
                 continue
 
             auth = wire.parse_auth_head(d0["payload"])
             if not auth:
+                self._count_auth_packet(received, "short auth header", d0["payload"].hex())
                 continue
             auth_type, payload = auth
 
             if auth_type == wire.AUTH_TYPE_CHALLENGE and len(payload) >= 16:
+                got_challenge = True
                 response = crypto_utils.encrypt_block(self.password, payload[:16])
                 self._send_auth(wire.AUTH_TYPE_RESPONSE, response)
                 log("[auth] sent AES response to camera challenge")
@@ -557,9 +592,20 @@ class CameraSession:
             elif auth_type == wire.AUTH_TYPE_FAILED:
                 log("[auth] camera rejected the password")
                 return False
+            else:
+                log(f"[auth] unexpected auth message type={auth_type} size={len(payload)}: {d0['payload'][:32].hex()}")
 
-        log("[auth] timed out waiting for the camera")
+        summary = ", ".join(f"{key} x{count}" for key, count in received.items()) or "nothing"
+        stage = "after our response" if got_challenge else "no challenge"
+        log(f"[auth] timed out waiting for the camera after {timeout:.0f}s ({stage}); received: {summary}")
         return False
+
+    @staticmethod
+    def _count_auth_packet(received: dict, key: str, detail: str = "") -> None:
+        """Tally a packet seen during auth() for the timeout summary, logging the first of each kind."""
+        received[key] = received.get(key, 0) + 1
+        if received[key] == 1:
+            log(f"[auth] received {key}" + (f": {detail}" if detail else ""))
 
     def reconnect(self, resolution: int = ioctl.QUALITY_BY_SETTING) -> bool:
         """Redo discover -> alive -> auth -> video-start from scratch on the same socket, for
@@ -573,7 +619,6 @@ class CameraSession:
         self.camera_port = wire.CAMERA_PORT  # Reset to default baseline port
         self.session_key = None
         self.local_seq = 0
-        self.ack_id = 0
         self.talk_seq = 0
         self.session_epoch += 1
         if not self.discover(target_ip=self.target_ip, timeout=self.discover_timeout):
@@ -643,10 +688,10 @@ class CameraSession:
                     continue
                 if msg_type != wire.MSG_DATA:
                     continue
-                d0 = wire.parse_d0(body)
-                if not d0:
+                drw = wire.parse_drw_header(body)
+                if not drw:
                     continue
-                self._ack()
+                self._ack(drw[0], drw[1])
                 f.write(struct.pack(">II", count, len(body)))
                 f.write(body)
                 f.flush()
@@ -656,7 +701,7 @@ class CameraSession:
                      auth_username: Optional[str] = None,
                      auth_password: Optional[str] = None, enable_audio: bool = True,
                      gst_server_ref: Optional[dict] = None,
-                     enable_talkback: bool = True) -> None:
+                     enable_talkback: bool = True, keep_stream_open: bool = False) -> None:
         """Decode the post-auth data channel into H.264 access units and hand them to a
         GStreamer-backed RTSP server (gst_rtsp_server.py).
 
@@ -667,7 +712,8 @@ class CameraSession:
         at least one RTSP client has PLAYed, and told to stop (IOCTRL_TYPE_VIDEO_STOP) the
         moment the last one disconnects - a player that stops and later resumes (e.g. VLC's own
         pause/stop button) gets a fresh request instead of relying on a session the camera may
-        have already torn down silently.
+        have already torn down silently. With keep_stream_open, the camera keeps streaming once
+        started, and later clients just join the running stream.
         """
         if not self.session_key:
             raise RuntimeError("read_stream() requires a completed auth() call first")
@@ -777,6 +823,10 @@ class CameraSession:
                     self.is_streaming = True
                     return
 
+            if keep_stream_open and is_streaming:
+                log("[rtsp] client connected - camera stream already running")
+                return
+
             log("[rtsp] client connected - starting camera video/audio stream")
             if not self.session_key:
                 log("[rtsp] no active camera session yet (reconnecting) - client should retry")
@@ -837,6 +887,9 @@ class CameraSession:
             if enable_talkback:
                 talk.stop()
             if not is_streaming:
+                return
+            if keep_stream_open:
+                log("[rtsp] last client disconnected - keeping camera stream open (keep_stream_open)")
                 return
 
             log("[rtsp] Last client disconnected. Initiating a 30-second stream preserve grace window...")
