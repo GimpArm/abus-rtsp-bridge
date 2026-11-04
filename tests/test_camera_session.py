@@ -43,8 +43,43 @@ class HandshakeTests(unittest.TestCase):
         with patch.object(camera_session.time, "monotonic", return_value=100):
             self.session.alive_handshake()
         self.assertEqual(self.session.sock.recvfrom.call_count, 3)
-        self.assertEqual(self.session.sock.sendto.call_count, 1)
+        self.assertEqual(self.session.sock.sendto.call_count, 2)
+        self.assertEqual(self.session.sock.sendto.call_args.args, (b"\xf1\xe0\x00\x00", endpoint))
         self.assertEqual(self.session._pending_datagrams, [(challenge, endpoint)])
+
+    def test_auth_camera_requires_transport_confirmation_before_challenge(self):
+        self.session.camera_ip, self.session.camera_port = "127.0.0.3", 20001
+        endpoint = ("127.0.0.3", 20001)
+        session_key = bytes(range(16))
+        packets_received = 0
+
+        def receive(_size):
+            nonlocal packets_received
+            packets_received += 1
+            if packets_received == 1:
+                return b"\xf1\x42\x00\x00", endpoint
+            if packets_received == 2:
+                if not self.session.sock.sendto.called:
+                    return b"\xf1\xf0\x00\x00", endpoint
+                self.assertEqual(self.session.sock.sendto.call_args.args,
+                                 (b"\xf1\xe0\x00\x00", endpoint))
+                return (wire.build_d0(0, wire.CHANNEL_AUTH,
+                                     wire.build_auth_head(wire.AUTH_TYPE_CHALLENGE, bytes(16))), endpoint)
+            return (wire.build_d0(1, wire.CHANNEL_AUTH,
+                                 wire.build_auth_head(wire.AUTH_TYPE_OK,
+                                                      crypto_utils.encrypt_block("test", session_key))), endpoint)
+
+        self.session.sock.recvfrom.side_effect = receive
+        self.assertTrue(self.session.auth())
+        self.assertEqual(self.session.session_key, session_key)
+
+    def test_auth_does_not_confirm_alive_ack_from_another_endpoint(self):
+        self.session.camera_ip, self.session.camera_port = "127.0.0.3", 20001
+        self.session.sock.recvfrom.side_effect = [
+            (b"\xf1\x42\x00\x00", ("127.0.0.3", 20000)),
+            (b"\xf1\xf0\x00\x00", ("127.0.0.3", 20001))]
+        self.assertFalse(self.session.auth())
+        self.session.sock.sendto.assert_not_called()
 
     def test_auth_stops_immediately_when_selected_camera_closes(self):
         self.session.camera_ip, self.session.camera_port = "127.0.0.3", 20001

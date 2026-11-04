@@ -510,7 +510,8 @@ class CameraSession:
                 continue
             parsed = wire.parse_f1(data)
             if parsed and parsed[0] == wire.MSG_ALIVE_ACK:
-                log("[alive] camera acknowledged session")
+                self._send(wire.build_f1(wire.MSG_PING))
+                log("[alive] camera acknowledged session; sent transport confirmation (0xE0)")
                 return
             if parsed and parsed[0] == wire.MSG_DATA:
                 self._pending_datagrams.append((data, addr))
@@ -566,6 +567,11 @@ class CameraSession:
             msg_type, body = parsed
             self._count_auth_packet(received, f"0x{msg_type:02x}")
 
+            if msg_type == wire.MSG_ALIVE_ACK:
+                self._send(wire.build_f1(wire.MSG_PING))
+                if received[f"0x{msg_type:02x}"] == 1:
+                    log("[auth] confirmed repeated alive ack with transport ping (0xE0)")
+                continue
             if msg_type == wire.MSG_PING:
                 self._send(wire.build_f1(wire.MSG_PONG))
                 continue
