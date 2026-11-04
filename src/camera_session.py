@@ -373,6 +373,7 @@ class CameraSession:
             garbage. Sends the same encode_did()-based F1/0x41 alive request the real app
             uses (not a bare "cs2" 0x40 punch - that's not what real traffic shows either)."""
             alive_payload = wire.encode_did(self.did)
+            early_data: List[Tuple[bytes, Tuple[str, int]]] = []
             old_timeout = self.sock.gettimeout()
             self.sock.settimeout(per_try_timeout)
             try:
@@ -391,7 +392,14 @@ class CameraSession:
                             continue
                         parsed = wire.parse_f1(data)
                         if parsed and parsed[0] == wire.MSG_ALIVE_ACK:
+                            self._pending_datagrams.extend(early_data)
+                            if early_data:
+                                log(f"[discover-p2p] preserved {len(early_data)} early data packet(s) for auth")
                             return True
+                        if parsed and parsed[0] == wire.MSG_DATA:
+                            early_data.append((data, addr))
+                        elif parsed and parsed[0] == wire.MSG_PING:
+                            self._send(wire.build_f1(wire.MSG_PONG), target=(ip, port))
                 return False
             finally:
                 self.sock.settimeout(old_timeout)
@@ -495,7 +503,8 @@ class CameraSession:
         if not self.camera_ip or not self.did:
             return
         payload = wire.encode_did(self.did)
-        self._pending_datagrams.clear()
+        self._pending_datagrams = [packet for packet in self._pending_datagrams
+                                   if packet[1] == (self.camera_ip, self.camera_port)]
         deadline = time.monotonic() + timeout
         next_probe = 0.0
         while time.monotonic() < deadline:
@@ -515,6 +524,8 @@ class CameraSession:
                 return
             if parsed and parsed[0] == wire.MSG_DATA:
                 self._pending_datagrams.append((data, addr))
+            elif parsed and parsed[0] == wire.MSG_PING:
+                self._send(wire.build_f1(wire.MSG_PONG))
         log(f"[alive] no alive ack from the camera within {timeout:.0f}s - continuing anyway")
 
     def auth(self, timeout: float = 10.0) -> bool:
@@ -576,7 +587,10 @@ class CameraSession:
                 self._send(wire.build_f1(wire.MSG_PONG))
                 continue
             if msg_type == wire.MSG_STREAM_END:
-                log("[auth] camera closed the session (0xF0) during the handshake")
+                stage = "after challenge response" if got_challenge else "before any auth challenge"
+                summary = ", ".join(f"{key} x{count}" for key, count in received.items())
+                log(f"[auth] camera closed the session (0xF0) {stage}, "
+                    f"elapsed={time.time() - start:.3f}s; received: {summary}")
                 return False
             if msg_type != wire.MSG_DATA:
                 continue
@@ -636,6 +650,7 @@ class CameraSession:
         self.camera_ip = None
         self.camera_port = wire.CAMERA_PORT  # Reset to default baseline port
         self.session_key = None
+        self._pending_datagrams.clear()
         self.local_seq = 0
         self.talk_seq = 0
         self.session_epoch += 1
