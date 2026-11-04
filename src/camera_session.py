@@ -302,26 +302,32 @@ class CameraSession:
         targets: List[str] = []
         if target_ip:
             targets.append(target_ip)
-        try:
-            iface = ipaddress.IPv4Interface(f"{self.bind_ip}/24")
-            targets.append(str(iface.network.broadcast_address))
-        except ValueError:
-            pass
-        targets.append("255.255.255.255")
+        else:
+            try:
+                iface = ipaddress.IPv4Interface(f"{self.bind_ip}/24")
+                targets.append(str(iface.network.broadcast_address))
+            except ValueError:
+                pass
+            targets.append("255.255.255.255")
 
         # Loop local discovery for half the timeout period before failing over
-        local_deadline = time.time() + (timeout / 2.0)
+        local_deadline = time.monotonic() + (timeout / 2.0)
+        next_probe = 0.0
         req = wire.build_f1(wire.MSG_SEARCH)
 
-        while time.time() < local_deadline and self.camera_ip is None:
-            for target in targets:
-                try:
-                    self.sock.sendto(req, (target, wire.DISCOVERY_PORT))
-                except OSError:
-                    pass
+        while time.monotonic() < local_deadline and self.camera_ip is None:
+            if time.monotonic() >= next_probe:
+                for target in targets:
+                    try:
+                        self.sock.sendto(req, (target, wire.DISCOVERY_PORT))
+                    except OSError:
+                        pass
+                next_probe = time.monotonic() + 1.0
             try:
                 data, addr = self.sock.recvfrom(4096)
             except (socket.timeout, ConnectionResetError, OSError):
+                continue
+            if target_ip and addr[0] != target_ip:
                 continue
             parsed = wire.parse_f1(data)
             if not parsed:
@@ -337,7 +343,8 @@ class CameraSession:
             self.camera_ip = addr[0]
             self.camera_port = addr[1]
             self.did = found_did
-            log(f"[discover] Local LAN camera identified: ip={self.camera_ip} port={self.camera_port}")
+            log(f"[discover] Local LAN camera identified: ip={self.camera_ip} port={self.camera_port} "
+                f"local={self.sock.getsockname()}")
             return True
 
         # --- P2P CLOUD FALLBACK SERVICE CHANNEL ---
@@ -380,7 +387,7 @@ class CameraSession:
                             data, addr = self.sock.recvfrom(2048)
                         except (socket.timeout, ConnectionResetError, OSError):
                             break
-                        if addr[0] != ip:
+                        if addr != (ip, port):
                             continue
                         parsed = wire.parse_f1(data)
                         if parsed and parsed[0] == wire.MSG_ALIVE_ACK:
@@ -489,12 +496,17 @@ class CameraSession:
             return
         payload = wire.encode_did(self.did)
         self._pending_datagrams.clear()
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            self._send(wire.build_f1(wire.MSG_ALIVE_REQ, payload))
+        deadline = time.monotonic() + timeout
+        next_probe = 0.0
+        while time.monotonic() < deadline:
+            if time.monotonic() >= next_probe:
+                self._send(wire.build_f1(wire.MSG_ALIVE_REQ, payload))
+                next_probe = time.monotonic() + 1.0
             try:
                 data, addr = self.sock.recvfrom(65535)
             except (socket.timeout, ConnectionResetError, OSError):
+                continue
+            if addr != (self.camera_ip, self.camera_port):
                 continue
             parsed = wire.parse_f1(data)
             if parsed and parsed[0] == wire.MSG_ALIVE_ACK:
@@ -559,7 +571,7 @@ class CameraSession:
                 continue
             if msg_type == wire.MSG_STREAM_END:
                 log("[auth] camera closed the session (0xF0) during the handshake")
-                continue
+                return False
             if msg_type != wire.MSG_DATA:
                 continue
 
@@ -587,7 +599,7 @@ class CameraSession:
                 log("[auth] sent AES response to camera challenge")
             elif auth_type == wire.AUTH_TYPE_OK and len(payload) >= 16:
                 self.session_key = crypto_utils.decrypt_block(self.password, payload[:16])
-                log(f"[auth] session established, session_key={self.session_key.hex()}")
+                log("[auth] session established")
                 return True
             elif auth_type == wire.AUTH_TYPE_FAILED:
                 log("[auth] camera rejected the password")
@@ -811,6 +823,10 @@ class CameraSession:
             nonlocal expected_data_seq, last_seq_advance_time
             nonlocal seen_real_audio, disconnect_timer, disconnect_generation
 
+            if not self.session_key or self.reconnecting_since is not None:
+                log("[rtsp] camera session is reconnecting - client should retry")
+                return
+
             with disconnect_lock:
                 if disconnect_timer is not None:
                     log("[rtsp] Client re-connected during active grace window. Canceling pending stop_video command.")
@@ -886,6 +902,9 @@ class CameraSession:
             nonlocal is_streaming, disconnect_timer, disconnect_generation
             if enable_talkback:
                 talk.stop()
+            if not self.session_key or self.reconnecting_since is not None:
+                log("[rtsp] last client disconnected while camera session is reconnecting")
+                return
             if not is_streaming:
                 return
             if keep_stream_open:
